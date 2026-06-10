@@ -735,9 +735,14 @@ class SchedulingGymEnv:
         The schedule order determines issue priority: at each cycle, the
         first K ready nodes in schedule order are issued.
         """
-        # Deterministic seed per schedule (reproducible per graph)
-        schedule_seed = hash(tuple(self.schedule)) & 0x7FFFFFFF
-        random.seed(schedule_seed)
+        # Deterministic seed per schedule (reproducible across process restarts).
+        # Python's built-in hash() is randomized by PYTHONHASHSEED, so we
+        # build a simple polynomial hash from character codes of node names.
+        h = 0
+        for nid in self.schedule:
+            for ch in nid:
+                h = (h * 127 + ord(ch)) & 0x7FFFFFFF
+        random.seed(h)
         K = self.max_exec_units
         graph = self.graph
         schedule = self.schedule
