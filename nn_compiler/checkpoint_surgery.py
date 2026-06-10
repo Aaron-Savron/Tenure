@@ -15,7 +15,7 @@ Surgery plan:
 """
 
 import torch
-from typing import Dict
+from typing import Dict, Optional
 
 
 def transplant_weights(
@@ -26,6 +26,7 @@ def transplant_weights(
     device: str = "cpu",
     spill_bias_init: float = -1.0,
     spill_noise_scale: float = 0.01,
+    output_path: Optional[str] = None,
 ) -> dict:
     """
     Load an old checkpoint and splice its weights into a new SchedulingPolicy.
@@ -39,6 +40,8 @@ def transplant_weights(
         spill_bias_init: Initial bias for the Spill head (default -1.0,
                          conservative — don't spill until trained to).
         spill_noise_scale: Std of Gaussian noise for the Spill head weights.
+        output_path: If provided, save the surgically-modified checkpoint
+                     to this path (e.g., "checkpoints/production_v2_init.pt").
 
     Returns:
         new_state_dict: The surgically-modified state dict.
@@ -103,6 +106,22 @@ def transplant_weights(
     )
     new_sd["priority_head.2.weight"][1, :] = noise[0, :]
     new_sd["priority_head.2.bias"][1] = torch.tensor(spill_bias_init)
+
+    # ── Architecture mismatch guard ──
+    n_old_layers = sum(
+        1 for k in old_sd
+        if k.startswith("gat_convs.") and k.endswith(".lin.weight")
+    )
+    if n_old_layers != 4:
+        print(f"  [WARN] Old checkpoint has {n_old_layers} GAT layers, "
+              f"expected 4. Layers >{n_old_layers} have random init.")
+
+    # ── Save surgically-modified checkpoint ──
+    if output_path is not None:
+        import os
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        torch.save({"policy_state_dict": new_sd}, output_path)
+        print(f"  [Checkpoint saved] {output_path}")
 
     return new_sd
 

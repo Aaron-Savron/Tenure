@@ -488,7 +488,7 @@ def collect_scheduling_episode_ppo_v2(env, policy, device="cpu"):
 def train_scheduling_episode_ppo_v2(env, policy, optimizer, baseline,
                                      entropy_coef=0.01, reward_scale=1.0,
                                      clip_epsilon=0.2, ppo_epochs=3,
-                                     device="cpu"):
+                                     device="cpu", track_kl: bool = False):
     """
     v2 PPO training step for the flat 2N action space.
 
@@ -496,6 +496,13 @@ def train_scheduling_episode_ppo_v2(env, policy, optimizer, baseline,
     distribution. The GAT body may be frozen (requires_grad=False) — this
     function works correctly either way since .backward() only flows through
     trainable parameters.
+
+    When track_kl=True, computes approximate KL divergence between the
+    old and new policy distributions after the final PPO epoch and returns
+    it via info['approx_kl']. The KL is computed as:
+        KL ≈ mean(exp(new_lp - old_lp) - 1 - (new_lp - old_lp))
+    which is the second-order Taylor expansion of KL, numerically stable
+    for small divergences.
     """
     reward, old_log_probs, observations, actions, info = \
         collect_scheduling_episode_ppo_v2(env, policy, device)
@@ -508,8 +515,14 @@ def train_scheduling_episode_ppo_v2(env, policy, optimizer, baseline,
     if n_steps == 0:
         return reward, info
 
+    # Track KL across all steps in the final epoch
+    final_epoch_kls: list = [] if track_kl else None
+
     for epoch in range(ppo_epochs):
         epoch_losses = []
+        if track_kl:
+            epoch_kls = []
+
         for obs, old_lp, act in zip(observations, old_log_probs, actions):
             probs = policy._get_priority_distribution(obs)
             mask = obs.get("action_mask", obs.get("ready_mask"))
@@ -518,6 +531,13 @@ def train_scheduling_episode_ppo_v2(env, policy, optimizer, baseline,
             dist = Categorical(probs)
             action_tensor = torch.tensor(act, device=device)
             new_lp = dist.log_prob(action_tensor)
+
+            # Approximate KL: π_old * log(π_old/π_new)
+            # Use the numerically stable form: exp(d) - 1 - d where d = new_lp - old_lp
+            if track_kl:
+                log_ratio = new_lp - old_lp
+                kl_step = torch.exp(log_ratio) - 1.0 - log_ratio
+                epoch_kls.append(kl_step)
 
             ratio = torch.exp(new_lp - old_lp)
             surr1 = ratio * advantage
@@ -539,6 +559,12 @@ def train_scheduling_episode_ppo_v2(env, policy, optimizer, baseline,
             [p for p in policy.parameters() if p.requires_grad], 1.0
         )
         optimizer.step()
+
+        if track_kl and epoch_kls:
+            final_epoch_kls = epoch_kls  # keep last epoch's KL for logging
+
+    if track_kl and final_epoch_kls:
+        info["approx_kl"] = torch.stack(final_epoch_kls).mean().item()
 
     return reward, info
 
@@ -606,13 +632,19 @@ def frozen_adaptation_train(
     save_every: int = 500,
     checkpoint_dir: str = "checkpoints",
     device: str = "cpu",
+    from_scratch: bool = False,
 ) -> dict:
     """
     Phase 1: Frozen Adaptation Training.
 
-    Loads the surgically-transplanted v2_init checkpoint, freezes the
-    GAT body, and trains ONLY input_proj and priority_head on a corpus
-    of small DL subgraphs with low memory latency (mem_latency=3).
+    When from_scratch=False (default): loads the surgically-transplanted
+    v2_init checkpoint, freezes the GAT body, and trains ONLY input_proj
+    and priority_head on a corpus of small DL subgraphs.
+
+    When from_scratch=True: creates a random-initialized SchedulingPolicy
+    (15-dim), freezes the GAT body, and trains from scratch. This avoids
+    the v1 weight transfer entirely — the GAT starts with random attention
+    maps and must learn spill-aware representations from the beginning.
 
     The model learns the syntax of the 2N action space (Issue vs Spill)
     without risking corruption of the pre-trained GAT attention maps.
@@ -621,8 +653,12 @@ def frozen_adaptation_train(
     from itertools import cycle
 
     print("=" * 66)
-    print("  PHASE 1: FROZEN ADAPTATION")
-    print("  Transplant v1 GAT body -> train new 2N action head")
+    if from_scratch:
+        print("  PHASE 1 (FROM SCRATCH): FROZEN ADAPTATION")
+        print("  Random-init GAT body -> train new 2N action head")
+    else:
+        print("  PHASE 1: FROZEN ADAPTATION (v1 transplant)")
+        print("  Transplant v1 GAT body -> train new 2N action head")
     print("=" * 66)
 
     # Build corpus (deferred import to avoid circular deps)
@@ -630,13 +666,20 @@ def frozen_adaptation_train(
 
     # ── Build policy ────────────────────────────────
     policy = SchedulingPolicy(node_feat_dim=15).to(device)
-    transplant_weights(
-        "nn_compiler/production_v1.pt", policy,
-        device=device,
-        output_path=checkpoint_path,
-    )
-    print(f"  Checkpoint: {checkpoint_path}")
-    print(f"  Policy params: {sum(p.numel() for p in policy.parameters())}")
+
+    if from_scratch:
+        # Random init — no weight surgery
+        print(f"  Random-init SchedulingPolicy(15-dim)")
+        print(f"  Policy params: {sum(p.numel() for p in policy.parameters())}")
+    else:
+        # Weight surgery from v1 checkpoint
+        transplant_weights(
+            "nn_compiler/production_v1.pt", policy,
+            device=device,
+            output_path=checkpoint_path,
+        )
+        print(f"  Checkpoint: {checkpoint_path}")
+        print(f"  Policy params: {sum(p.numel() for p in policy.parameters())}")
 
     # ── Freeze GAT body ─────────────────────────────
     trainable = freeze_gat_body(policy)
@@ -649,10 +692,12 @@ def frozen_adaptation_train(
           f"alpha={register_penalty_alpha}")
     print(f"  entropy={entropy_coef}, clip={clip_epsilon}, PPO epochs={ppo_epochs}")
     print(f"  Corpus: {len(corpus)} graph types")
+    print(f"  Init: {'from scratch (random)' if from_scratch else 'v1 transplant'}")
     print()
 
     # ── Training state ──────────────────────────────
-    baseline = RunningBaseline(alpha=0.9)
+    # Per-graph baselines for clean advantage signals
+    baselines: Dict[str, RunningBaseline] = {}
     episode_rewards = []
     episode_spills = []
     episode_reloads = []
@@ -701,8 +746,13 @@ def frozen_adaptation_train(
             mem_latency=mem_latency,
         )
 
+        # ── Per-label baseline ────────────────────────
+        if label not in baselines:
+            baselines[label] = RunningBaseline(alpha=0.9)
+        graph_baseline = baselines[label]
+
         reward, info = train_scheduling_episode_ppo_v2(
-            env, policy, optimizer, baseline,
+            env, policy, optimizer, graph_baseline,
             entropy_coef=entropy_coef,
             reward_scale=1.0,
             clip_epsilon=clip_epsilon,
@@ -798,14 +848,15 @@ def frozen_adaptation_train(
     print(f"  Total spills:    {total_spills:4d}")
     print(f"  Total reloads:   {total_reloads:4d}")
 
-    final_path = os.path.join(checkpoint_dir, "phase1_final.pt")
+    suffix = "_scratch" if from_scratch else ""
+    final_path = os.path.join(checkpoint_dir, f"phase1_final{suffix}.pt")
     torch.save({
         "policy_state_dict": policy.state_dict(),
         "phase": 1,
         "episode": num_episodes,
         "rewards": episode_rewards,
         "best_reward": best_reward,
-        "config": {},
+        "config": {"from_scratch": from_scratch},
     }, final_path)
     print(f"  Final checkpoint: {final_path}")
 
@@ -830,6 +881,16 @@ LATENCY_MILESTONES = {
     1200: 10,
 }
 
+# Progressive unfreezing schedule: maps episode -> list of GAT layer indices to thaw.
+# Layer 3 is closest to the priority head; layer 0 is closest to the input.
+# Thawing top-down prevents cascading feature drift in early layers.
+UNFREEZE_SCHEDULE = {
+    0: [3],            # Phase 2a: last layer only (bridge to new action space)
+    500: [2, 3],       # Phase 2b: last 2 layers (deeper semantic adjustment)
+    1000: [1, 2, 3],   # Phase 2c: last 3 layers
+    1500: [0, 1, 2, 3],# Phase 2d: full unfreeze (global alignment)
+}
+
 def _get_latency(episode: int) -> int:
     """Determine mem_latency for a given episode based on curriculum milestones."""
     lat = 3
@@ -837,6 +898,54 @@ def _get_latency(episode: int) -> int:
         if episode >= ep_milestone:
             lat = lat_val
     return lat
+
+
+def _get_unfreeze_layers(episode: int) -> list:
+    """Determine which GAT layers should be trainable at a given episode."""
+    layers = [3]  # default: last layer only
+    for ep_milestone, thaw_layers in sorted(UNFREEZE_SCHEDULE.items()):
+        if episode >= ep_milestone:
+            layers = thaw_layers
+    return layers
+
+
+def set_gat_layer_trainable(policy, target_layers: list):
+    """
+    Selectively unfreeze specific GAT layers while locking down the rest.
+
+    Args:
+        policy: SchedulingPolicy instance.
+        target_layers: List of layer indices to make trainable (e.g., [3] for last layer).
+                       Layer 0 is closest to input, layer 3 is closest to the head.
+
+    Keeps input_proj and priority_head trainable regardless.
+    Returns list of trainable parameter names for logging.
+    """
+    # First freeze ALL GAT params
+    frozen_count = 0
+    for name, param in policy.named_parameters():
+        if name.startswith("gat_convs.") or name.startswith("gat_lin."):
+            param.requires_grad = False
+            frozen_count += 1
+
+    # Thaw designated layers
+    thawed = []
+    for layer_idx in target_layers:
+        for name, param in policy.named_parameters():
+            if name.startswith(f"gat_convs.{layer_idx}.") or \
+               name.startswith(f"gat_lin.{layer_idx}."):
+                param.requires_grad = True
+                thawed.append(name)
+
+    # input_proj and priority_head always trainable
+    for name, param in policy.named_parameters():
+        if not name.startswith("gat_"):
+            param.requires_grad = True
+
+    n_trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+    layer_str = ", ".join(str(l) for l in sorted(target_layers))
+    print(f"  GAT layers thawed: [{layer_str}] — {n_trainable:,} trainable params")
+    return thawed
 
 
 def _build_escalation_corpus():
@@ -959,6 +1068,7 @@ def unfrozen_escalation_train(
     optimizer = torch.optim.Adam(policy.parameters(), lr=learning_rate)
     total_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     print(f"  Optimizer: Adam(lr={learning_rate}), {total_params:,} trainable params")
+    print(f"  entropy={entropy_coef}, clip={clip_epsilon}, PPO epochs={ppo_epochs}")
     print()
 
     # ── Progressive pool manager ────────────────────
@@ -1011,7 +1121,10 @@ def unfrozen_escalation_train(
     graduated = []  # (ep, label, tier, mastery_at_graduation)
 
     # ── Training state ──────────────────────────────
-    baseline = RunningBaseline(alpha=0.9)
+    # Per-graph baselines: each topology label gets its own EMA.
+    # This isolates the advantage signal to that specific graph's reward
+    # distribution, eliminating cross-topology "baseline whiplash."
+    baselines: Dict[str, RunningBaseline] = {}
     episode_rewards = []
     episode_spills = []
     episode_reloads = []
@@ -1019,6 +1132,12 @@ def unfrozen_escalation_train(
     deadlock_count = 0
     n_cpf_beaten = 0
     latency_schedule = []  # (ep, latency) at milestone transitions
+
+    # ── KL divergence tracking ────────────────────
+    # Compute approximate KL(π_old || π_new) after each PPO epoch.
+    # This is computed from old_log_probs and new_log_probs already available
+    # in train_scheduling_episode_ppo_v2. We log the mean per episode.
+    episode_kl = []  # mean KL per episode
 
     # Per-graph CPF cache (avoid recomputing every episode)
     cpf_cache: Dict[str, tuple] = {}  # label -> (cpf_reward, cpf_cycles)
@@ -1032,6 +1151,10 @@ def unfrozen_escalation_train(
         progress = tqdm(range(num_episodes), desc="Unfrozen Escalation")
     except ImportError:
         progress = range(num_episodes)
+
+    # ── Initialize progressive unfreeze ───────────
+    current_layers = _get_unfreeze_layers(0)
+    set_gat_layer_trainable(policy, current_layers)
 
     for episode in progress:
         # ── Determine current latency ────────────────
@@ -1098,14 +1221,27 @@ def unfrozen_escalation_train(
             mem_latency=current_lat,
         )
 
+        # ── Per-label baseline lookup ────────────────
+        # Each graph label gets its own EMA, preventing the shared-baseline
+        # whiplash where a hard LayerNorm episode's reward poisons the
+        # advantage signal for the next easy MLP episode.
+        if label not in baselines:
+            baselines[label] = RunningBaseline(alpha=0.9)
+        graph_baseline = baselines[label]
+
         reward, info = train_scheduling_episode_ppo_v2(
-            env, policy, optimizer, baseline,
+            env, policy, optimizer, graph_baseline,
             entropy_coef=entropy_coef,
             reward_scale=1.0,
             clip_epsilon=clip_epsilon,
             ppo_epochs=ppo_epochs,
             device=device,
+            track_kl=True,
         )
+
+        # ── KL logging ──────────────────────────────
+        if "approx_kl" in info:
+            episode_kl.append(info["approx_kl"])
 
         # Extract spill/reload counts
         n_spills = sum(1 for e in env.schedule
@@ -1150,12 +1286,21 @@ def unfrozen_escalation_train(
                 if chosen["label"] in cpf_cache:
                     del cpf_cache[chosen["label"]]
 
-        # ── Latency milestone logging ────────────────
+        # ── Latency milestone & unfreeze logging ──────
         if episode == 0 or (
             episode in LATENCY_MILESTONES and current_lat != _get_latency(episode - 1)
         ):
             latency_schedule.append((episode, current_lat))
             print(f"  Ep {episode:4d}: Latency step-up -> mem_latency={current_lat}")
+
+        # ── Progressive unfreeze check ───────────────
+        new_layers = _get_unfreeze_layers(episode)
+        if new_layers != current_layers:
+            set_gat_layer_trainable(policy, new_layers)
+            current_layers = new_layers
+            # Recreate optimizer with new param set
+            optimizer = torch.optim.Adam(policy.parameters(), lr=learning_rate)
+            print(f"  Ep {episode:4d}: Unfreeze step-up -> layers {current_layers}")
 
         # ── Logging ──────────────────────────────────
         if (episode + 1) % log_every == 0 or episode < 5:
@@ -1163,6 +1308,8 @@ def unfrozen_escalation_train(
             avg_r = sum(recent_r) / len(recent_r)
             avg_s = (sum(episode_spills[-min(log_every, len(episode_spills)):])
                      / min(log_every, len(episode_spills)))
+            avg_kl = sum(episode_kl[-min(log_every, len(episode_kl)):]) / min(log_every, len(episode_kl)) if episode_kl else 0.0
+
             pool_mastery = {
                 info["label"]: (
                     sum(info["cpf_hits"][-GRAD_WINDOW:]) / len(info["cpf_hits"][-GRAD_WINDOW:])
@@ -1176,6 +1323,8 @@ def unfrozen_escalation_train(
                     f"  Ep {episode + 1:4d}/{num_episodes} | "
                     f"reward={avg_r:7.1f} | "
                     f"lat={current_lat:2d} | "
+                    f"L{min(current_layers)}-{max(current_layers)} | "
+                    f"kl={avg_kl:.4f} | "
                     f"spills={avg_s:.1f}/ep | "
                     f"pool={len(active_pool)}g | "
                     f"grad={len(graduated)} | "
@@ -1191,6 +1340,8 @@ def unfrozen_escalation_train(
                 progress.set_postfix({
                     "avg": f"{avg_r:.1f}",
                     "lat": current_lat,
+                    "layers": f"{min(current_layers)}-{max(current_layers)}",
+                    "kl": f"{avg_kl:.4f}",
                     "pool": len(active_pool),
                     "grad": len(graduated),
                     "dead": deadlock_count,
