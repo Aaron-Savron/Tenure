@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-from torch_geometric.nn import GATConv
+from torch_geometric.nn import GATConv, GATv2Conv
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -197,6 +197,145 @@ def encode_observation(env):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  Lane Topology Inference
+# ═══════════════════════════════════════════════════════════════
+
+def _infer_lane_topology(graph, topo_order, node_names):
+    """
+    Infer parallel-lane structure from a dataflow DAG by structural traversal.
+
+    Returns five per-node dicts keyed by node name:
+      lane_id:             int   — lane index (0-based), -1 for non-lane nodes
+      lane_position:       int   — distance from lane root (0-based)
+      is_reduction:        bool  — True if node is a cross-lane reduction point
+      lane_depth:          int   — total number of ops in this node's lane
+      reduction_position:  int   — position within reduction right-fold chain
+                            (0-based), -1 for non-reduction nodes
+
+    Algorithm:
+      1. Find the broadcast input: the INPUT node with highest out-degree.
+      2. Its op-node children are the lane roots (first op of each lane).
+      3. Walk each chain forward: a node stays in the same lane as long as
+         it has exactly ONE child that is an op node. When a node feeds into
+         a reduction node (an op node with >= 2 op-node parents), the chain
+         ends and the target is classified as a reduction node.
+      4. The reduction right-fold chain is identified transitively.
+
+    Works on any DAG — no naming-convention dependency. Non-lane nodes
+    (INPUT, OUTPUT) get lane_id=-1 and zero-valued structural features.
+    """
+    op_set = set(topo_order)
+    name_to_idx = {name: i for i, name in enumerate(node_names)}
+
+    # Build children map (parent -> [child names that are op nodes])
+    children: dict = {nid: [] for nid in graph.nodes}
+    for child_id, child_node in graph.nodes.items():
+        for parent_id, _ in child_node.dependencies:
+            if parent_id in children:
+                children[parent_id].append(child_id)
+
+    # Build op-node parent counts: for each node, how many parents are op nodes?
+    op_parent_count: dict = {}
+    for nid in graph.nodes:
+        node = graph.nodes[nid]
+        op_parents = [
+            p for p, _ in node.dependencies
+            if p in op_set
+        ]
+        op_parent_count[nid] = len(op_parents)
+
+    # ── 1. Find broadcast input ─────────────────────
+    broadcast_name = None
+    max_out = 0
+    for in_id in graph.inputs:
+        out_deg = len(children.get(in_id, []))
+        if out_deg > max_out:
+            max_out = out_deg
+            broadcast_name = in_id
+
+    # ── 2. Lane roots = op-node children of broadcast input ─
+    lane_roots = []
+    if broadcast_name is not None:
+        for child in children.get(broadcast_name, []):
+            if child in op_set:
+                lane_roots.append(child)
+
+    # ── 3. Walk each lane chain ─────────────────────
+    lane_id: dict = {}
+    lane_position: dict = {}
+    lane_depth: dict = {}
+    is_reduction: dict = {}
+
+    # Find reduction nodes: op nodes with >= 2 op-node parents.
+    # These are the right-fold merge points.
+    reduction_nodes: set = set()
+    for nid in op_set:
+        if op_parent_count.get(nid, 0) >= 2:
+            reduction_nodes.add(nid)
+
+    for root_idx, root in enumerate(lane_roots):
+        # Walk forward from root
+        chain = [root]
+        current = root
+        while True:
+            # Get op-node children of current
+            op_children = [c for c in children.get(current, []) if c in op_set]
+
+            if len(op_children) == 1:
+                nxt = op_children[0]
+                # If the only child is a reduction node, stop —
+                # the current node is the lane-last.
+                if nxt in reduction_nodes:
+                    break
+                chain.append(nxt)
+                current = nxt
+            elif len(op_children) == 0:
+                # Dead end (shouldn't happen in Phase 4/5, but handle gracefully)
+                break
+            else:
+                # Multiple op children — this node is a fork point,
+                # not a simple chain. Stop the lane here.
+                break
+
+        # Assign lane features
+        depth = len(chain)
+        for pos, nid in enumerate(chain):
+            lane_id[nid] = root_idx
+            lane_position[nid] = pos
+            lane_depth[nid] = depth
+            is_reduction[nid] = False
+
+    # ── 4. Classify reduction nodes ──────────────────
+    # Reduction nodes appear in topo_order; assign them is_reduction=True
+    # and track position within the reduction right-fold chain.
+    reduction_chain = []
+    for nid in topo_order:
+        if nid in reduction_nodes:
+            reduction_chain.append(nid)
+
+    reduction_position: dict = {}
+    num_red = len(reduction_chain)
+    for pos, nid in enumerate(reduction_chain):
+        lane_id[nid] = -1
+        lane_position[nid] = 0
+        lane_depth[nid] = 0
+        is_reduction[nid] = True
+        reduction_position[nid] = pos
+
+    # ── 5. Assign defaults for all unclassified nodes ─
+    for nid in graph.nodes:
+        if nid not in lane_id:
+            lane_id[nid] = -1
+            lane_position[nid] = 0
+            lane_depth[nid] = 0
+            is_reduction[nid] = False
+        if nid not in reduction_position:
+            reduction_position[nid] = -1
+
+    return lane_id, lane_position, is_reduction, lane_depth, reduction_position
+
+
+# ═══════════════════════════════════════════════════════════════
 #  Scheduling Observation Encoder
 # ═══════════════════════════════════════════════════════════════
 
@@ -204,19 +343,28 @@ def encode_scheduling_obs(env):
     """
     Convert the scheduling environment state into GNN-ready tensors.
 
-    Node features [num_nodes, 13]:
-      [0..6] = one-hot opcode: Input, Mul, Add, Switch, CmpGeZ, Output, Merge
-      [7]    = is this node ready to fire?
-      [8]    = has this node been executed already?
-      [9]    = node height (longest hop path to output, normalized)
-      [10]   = downstream latency sum (total descendant work, normalized)
-      [11]   = CPD: critical path distance (longest latency path to output,
-               normalized by max CPD across all nodes)      [12]   = register pressure: outstanding_values / max_registers (capped at 1.0),
-              0.0 when max_registers is not set (unlimited)
-      [13]   = Is_Spilled: 1.0 if node's output is currently in the stack pool
-               (spilled out of register file), 0.0 otherwise.
-      [14]   = Remaining_Reloads: count of yet-to-issue consumers for this
-               spilled value (0 for non-spilled nodes).
+    Node features [num_nodes, 20]:
+      [0..6]  = one-hot opcode: Input, Mul, Add, Switch, CmpGeZ, Output, Merge
+      [7]     = is this node ready to fire?
+      [8]     = has this node been executed already?
+      [9]     = node height (longest hop path to output, normalized)
+      [10]    = downstream latency sum (total descendant work, normalized)
+      [11]    = CPD: critical path distance (longest latency path to output,
+                normalized by max CPD across all nodes)
+      [12]    = register pressure: outstanding_values / max_registers (capped at 1.0),
+                0.0 when max_registers is not set (unlimited)
+      [13]    = Is_Spilled: 1.0 if node's output is currently in the stack pool
+                (spilled out of register file), 0.0 otherwise.
+      [14]    = Remaining_Reloads: count of yet-to-issue consumers for this
+                spilled value (0 for non-spilled nodes).
+      [15]    = lane_id: which parallel lane this node belongs to,
+                normalized by (num_lanes - 1). 0.0 for non-lane nodes.
+      [16]    = lane_position: distance from lane root, normalized by
+                (lane_depth - 1). Higher = closer to reduction point.
+      [17]    = is_reduction: 1.0 if cross-lane reduction node, 0.0 otherwise.
+      [18]    = lane_depth: total ops in this lane, normalized by max lane depth.
+      [19]    = reduction_position: position within reduction right-fold chain,
+                normalized. 0.0 for non-reduction nodes.
 
     Action mask: [2 * num_op_nodes] boolean where:
       0..N-1: Issue (node unissued + ready + not spilled) or
@@ -277,12 +425,20 @@ def encode_scheduling_obs(env):
         cpd[nid] = own + child_max
     max_cpd = max(cpd.values()) if cpd else 1
 
+    # ── Lane topology inference ───────────────────
+    lane_id, lane_position, is_reduction, lane_depth, reduction_position = _infer_lane_topology(
+        graph, topo_order, node_names
+    )
+    num_lanes = max(1, max((v for v in lane_id.values() if v >= 0), default=0) + 1)
+    max_lane_depth = max((v for v in lane_depth.values() if v > 0), default=1)
+    num_red_nodes = sum(1 for v in is_reduction.values() if v)
+
     # ── Node features ──────────────────────────────
     type_to_feat = {
         "Input": 0, "Mul": 1, "Add": 2, "Switch": 3,
         "CmpGeZ": 4, "Output": 5, "Merge": 6,
     }
-    feat_dim = 15
+    feat_dim = 20
     x = torch.zeros(num_nodes, feat_dim)
 
     ready_set = set(env._ready_set())
@@ -330,6 +486,25 @@ def encode_scheduling_obs(env):
             x[i, 14] = float(env.node_consumers[name])
         else:
             x[i, 14] = 0.0
+
+        # Feature 15: lane_id (normalized by num_lanes)
+        lid = lane_id.get(name, -1)
+        x[i, 15] = lid / max(num_lanes - 1, 1) if lid >= 0 else 0.0
+
+        # Feature 16: lane_position (normalized by lane_depth)
+        lpos = lane_position.get(name, 0)
+        ldepth = lane_depth.get(name, 1)
+        x[i, 16] = lpos / max(ldepth - 1, 1) if ldepth > 1 else 0.0
+
+        # Feature 17: is_reduction
+        x[i, 17] = 1.0 if is_reduction.get(name, False) else 0.0
+
+        # Feature 18: lane_depth (normalized by max_lane_depth)
+        x[i, 18] = ldepth / max(max_lane_depth, 1)
+
+        # Feature 19: reduction_position (normalized, 0.0 for non-reduction)
+        rpos = reduction_position.get(name, -1)
+        x[i, 19] = rpos / max(num_red_nodes - 1, 1) if rpos >= 0 else 0.0
 
     # ── N-length ready mask (for CPD tracking, backward compat) ──
     n_ready_mask = torch.zeros(len(node_names), dtype=torch.bool)
@@ -382,11 +557,11 @@ class SchedulingPolicy(nn.Module):
       0..N-1: Issue (if ready + unissued) or Reload (if spilled)
       N..2N-1: Spill (if node's output is live in a register)
 
-    Default: 15-dim node features (13 structural + spilled + reloads),
+    Default: 20-dim node features (15 structural + 5 lane topology),
     256-dim hidden, 4-layer 4-head GAT.
     """
 
-    def __init__(self, node_feat_dim=15, hidden_dim=256, num_layers=4):
+    def __init__(self, node_feat_dim=20, hidden_dim=256, num_layers=4):
         super().__init__()
         self.hidden_dim = hidden_dim
 
@@ -433,6 +608,273 @@ class SchedulingPolicy(nn.Module):
                 probs = valid / valid.sum()
             else:
                 probs = torch.ones_like(flat_scores) / len(flat_scores)
+        else:
+            probs = F.softmax(masked, dim=0)
+        return probs
+
+    def sample_action(self, obs):
+        """Sample a 2N action index."""
+        probs = self._get_priority_distribution(obs)
+        mask = obs.get("action_mask", obs.get("ready_mask"))
+
+        if not mask.any() or probs.sum() == 0:
+            return None, torch.tensor(0.0)
+
+        dist = Categorical(probs)
+        action_idx = dist.sample()
+        log_prob = dist.log_prob(action_idx)
+        return action_idx.item(), log_prob
+
+    def forward(self, obs):
+        return self.sample_action(obs)
+
+    def get_entropy(self, obs):
+        probs = self._get_priority_distribution(obs)
+        mask = obs.get("action_mask", obs.get("ready_mask"))
+        if not mask.any() or probs.sum() == 0:
+            return torch.tensor(0.0)
+        dist = Categorical(probs)
+        return dist.entropy()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Hierarchical Scheduling Policy (GATv2 + Local/Global Attention)
+# ═══════════════════════════════════════════════════════════════
+
+BOUNDARY_OUTDEGREE_THRESHOLD = 3  # nodes with >= this many children are "boundary"
+
+
+class HierarchicalSchedulingPolicy(nn.Module):
+    """
+    GNN policy with GATv2 dynamic attention and hierarchical masking.
+
+    Architecture:
+      - Local branch: 3-layer GATv2 on full dataflow edge_index
+        (captures local dependency patterns within 3-hop neighborhoods)
+      - Global branch: 3-layer GATv2 on sparse boundary edge_index
+        (all nodes <-> boundary nodes with out-degree >= 3, tracking
+         global register pressure across subgraph boundaries)
+      - Fusion: concat(local_embed, global_embed) -> Linear(2H -> H)
+      - Priority head: [num_nodes, 2] scores (Issue/Reload, Spill)
+
+    This mirrors SchedulingPolicy's API exactly: _encode(),
+    _get_priority_distribution(), sample_action(), forward(),
+    get_entropy(). The observation encoder (encode_scheduling_obs)
+    is unchanged — the policy computes boundary edge_index internally
+    from the dataflow edge_index.
+
+    Default: 20-dim node features, 256-dim hidden, 3+3 GATv2 layers, 4 heads.
+    """
+
+    def __init__(
+        self,
+        node_feat_dim=20,
+        hidden_dim=256,
+        num_local_layers=3,
+        num_global_layers=3,
+        heads=4,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_local_layers = num_local_layers
+        self.num_global_layers = num_global_layers
+        head_dim = hidden_dim // heads
+
+        # ── Shared input projection ────────────────────
+        self.input_proj = nn.Linear(node_feat_dim, hidden_dim)
+
+        # ── Local branch: GATv2 on dataflow edges ─────
+        self.local_convs = nn.ModuleList()
+        self.local_lin = nn.ModuleList()
+        for _ in range(num_local_layers):
+            self.local_convs.append(
+                GATv2Conv(hidden_dim, head_dim, heads=heads, concat=True)
+            )
+            self.local_lin.append(nn.Linear(hidden_dim, hidden_dim))
+
+        # ── Global branch: GATv2 on boundary edges ────
+        self.global_convs = nn.ModuleList()
+        self.global_lin = nn.ModuleList()
+        for _ in range(num_global_layers):
+            self.global_convs.append(
+                GATv2Conv(hidden_dim, head_dim, heads=heads, concat=True)
+            )
+            self.global_lin.append(nn.Linear(hidden_dim, hidden_dim))
+
+        # ── Fusion: local || global -> hidden ─────────
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+        )
+
+        # ── Priority head: 2 scores per node ──────────
+        self.priority_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def _compute_boundary_edge_index(self, edge_index, num_nodes):
+        """
+        Build the global bipartite edge index for boundary attention.
+
+        Boundary nodes are those with out-degree >= BOUNDARY_OUTDEGREE_THRESHOLD
+        (default 3). These are the "spill points" — nodes whose output
+        feeds many consumers and creates register pressure.
+
+        The bipartite edge_index connects:
+          - All nodes -> boundary nodes  (boundary nodes aggregate global state)
+          - Boundary nodes -> all nodes  (everyone receives global signal)
+
+        Returns a [2, E] tensor. If no boundary nodes exist (tiny graph),
+        falls back to the top-3 highest-out-degree nodes.
+
+        Re-computation is O(N+E), negligible relative to the GATv2 forward pass.
+        """
+        # Compute out-degree from edge_index
+        out_degree = torch.zeros(num_nodes, dtype=torch.long, device=edge_index.device)
+        unique_src, counts = torch.unique(edge_index[0], return_counts=True)
+        out_degree[unique_src] = counts
+
+        # Boundary nodes: out-degree >= threshold
+        boundary_mask = out_degree >= BOUNDARY_OUTDEGREE_THRESHOLD
+        boundary_idx = torch.where(boundary_mask)[0]
+
+        if len(boundary_idx) == 0:
+            # Fallback: use top-3 highest out-degree nodes
+            k = min(3, num_nodes)
+            _, top_indices = torch.topk(out_degree, k)
+            boundary_idx = top_indices
+
+        # Build bipartite: all_nodes <-> boundary_nodes
+        all_idx = torch.arange(num_nodes, device=edge_index.device)
+
+        # Direction 1: all -> boundary (boundary aggregates)
+        src_a2b = all_idx.repeat_interleave(len(boundary_idx))
+        dst_a2b = boundary_idx.repeat(len(all_idx))
+
+        # Direction 2: boundary -> all (distribute global signal)
+        src_b2a = boundary_idx.repeat_interleave(len(all_idx))
+        dst_b2a = all_idx.repeat(len(boundary_idx))
+
+        return torch.stack([
+            torch.cat([src_a2b, src_b2a]),
+            torch.cat([dst_a2b, dst_b2a]),
+        ], dim=0)
+
+    def get_branch_norms(self, obs):
+        """
+        Compute L2 norms of local and global branch embeddings for logging.
+
+        Returns dict with:
+          - "local_norm": mean L2 norm of local branch node embeddings
+          - "global_norm": mean L2 norm of global branch node embeddings
+          - "norm_ratio": global_norm / (local_norm + 1e-8)
+
+        The norm_ratio tracks whether the global attention heads are active
+        relative to the local branch. A ratio near 0 means the global branch
+        is dormant; a ratio >> 1 means it's dominating.
+        """
+        with torch.no_grad():
+            _, h_local, h_global = self._encode(obs, return_branch_embeddings=True)
+            local_norm = h_local.norm(dim=-1).mean().item()
+            global_norm = h_global.norm(dim=-1).mean().item()
+
+        return {
+            "local_norm": local_norm,
+            "global_norm": global_norm,
+            "norm_ratio": global_norm / (local_norm + 1e-8),
+        }
+
+    def get_reduction_attention(self, obs):
+        """
+        Compute the global branch's embedding concentration on reduction nodes.
+
+        Splits node embeddings into reduction (obs['x'][:, 17] == 1.0) vs
+        non-reduction groups and returns the ratio of their mean L2 norms
+        in the global branch output. A ratio > 1.0 means the global branch
+        is concentrating on reduction/synchronization boundaries.
+
+        Returns dict with:
+          - "red_norm": mean global L2 norm for reduction nodes
+          - "nonred_norm": mean global L2 norm for non-reduction nodes
+          - "red_attn_ratio": red_norm / (nonred_norm + 1e-8)
+        """
+        with torch.no_grad():
+            _, _, h_global = self._encode(obs, return_branch_embeddings=True)
+            is_red = obs["x"][:, 17] > 0.5  # feature 17 = is_reduction
+            norms = h_global.norm(dim=-1)
+            if is_red.any():
+                red_norm = norms[is_red].mean().item()
+            else:
+                red_norm = 0.0
+            if (~is_red).any():
+                nonred_norm = norms[~is_red].mean().item()
+            else:
+                nonred_norm = 0.0
+
+        return {
+            "red_global_norm": red_norm,
+            "nonred_global_norm": nonred_norm,
+            "red_attn_ratio": red_norm / (nonred_norm + 1e-8),
+        }
+
+    def _encode(self, obs, return_branch_embeddings=False):
+        """
+        Encode node features through parallel local + global GATv2 branches,
+        then fuse via concatenation.
+
+        When return_branch_embeddings=True, returns (h_fused, h_local, h_global)
+        for per-mask-type logging. Default: returns just h_fused.
+        """
+        x = obs["x"]
+        edge_index = obs["edge_index"]
+        num_nodes = x.size(0)
+
+        h = self.input_proj(x)
+
+        # ── Local branch: operate on dataflow edges ───
+        h_local = h
+        for conv, lin in zip(self.local_convs, self.local_lin):
+            h_new = conv(h_local, edge_index)
+            h_new = F.elu(h_new)
+            h_new = lin(h_new)
+            h_local = h_local + h_new
+            h_local = F.elu(h_local)
+
+        # ── Global branch: operate on boundary edges ──
+        global_edge_index = self._compute_boundary_edge_index(
+            edge_index, num_nodes
+        )
+        h_global = h
+        for conv, lin in zip(self.global_convs, self.global_lin):
+            h_new = conv(h_global, global_edge_index)
+            h_new = F.elu(h_new)
+            h_new = lin(h_new)
+            h_global = h_global + h_new
+            h_global = F.elu(h_global)
+
+        # ── Fuse: concat local + global -> project ──
+        h_fused = self.fusion(torch.cat([h_local, h_global], dim=-1))
+
+        if return_branch_embeddings:
+            return h_fused, h_local, h_global
+        return h_fused
+
+    def _get_priority_distribution(self, obs):
+        """Compute masked 2N action distribution (same API as SchedulingPolicy)."""
+        h = self._encode(obs)
+        scores = self.priority_head(h)  # [num_nodes, 2]
+        flat_scores = scores.flatten()   # [2 * num_nodes]
+        mask = obs.get("action_mask", obs.get("ready_mask"))
+        masked = flat_scores.clone()
+        masked[~mask] = -float("inf")
+        if masked.max() == -float("inf"):
+            valid = mask.float()
+            if valid.sum() > 0:
+                probs = valid / valid.sum()
+            else:
+                probs = torch.ones_like(flat_scores) / max(len(flat_scores), 1)
         else:
             probs = F.softmax(masked, dim=0)
         return probs

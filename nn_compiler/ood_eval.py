@@ -250,7 +250,7 @@ class OODBenchmark:
         # Load model
         print(f"Loading checkpoint: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        policy = SchedulingPolicy(node_feat_dim=15).to(self.device)
+        policy = SchedulingPolicy(node_feat_dim=20).to(self.device)
         policy.load_state_dict(checkpoint["policy_state_dict"], strict=True)
         policy.eval()
 

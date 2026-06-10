@@ -22,6 +22,7 @@ from .compiler_env import (
 from .policy import (
     GNNPolicy,
     SchedulingPolicy,
+    HierarchicalSchedulingPolicy,
     encode_observation,
     encode_scheduling_obs,
     decode_action,
@@ -566,6 +567,20 @@ def train_scheduling_episode_ppo_v2(env, policy, optimizer, baseline,
     if track_kl and final_epoch_kls:
         info["approx_kl"] = torch.stack(final_epoch_kls).mean().item()
 
+    # ── Per-branch embedding norm logging (hierarchical policy only) ──
+    if isinstance(policy, HierarchicalSchedulingPolicy) and observations:
+        try:
+            branch_norms = policy.get_branch_norms(observations[0])
+            info["branch_local_norm"] = branch_norms["local_norm"]
+            info["branch_global_norm"] = branch_norms["global_norm"]
+            info["branch_norm_ratio"] = branch_norms["norm_ratio"]
+            red_attn = policy.get_reduction_attention(observations[0])
+            info["red_global_norm"] = red_attn["red_global_norm"]
+            info["nonred_global_norm"] = red_attn["nonred_global_norm"]
+            info["red_attn_ratio"] = red_attn["red_attn_ratio"]
+        except Exception:
+            pass  # best-effort; don't fail training over logging
+
     return reward, info
 
 
@@ -665,7 +680,7 @@ def frozen_adaptation_train(
     corpus = _build_frozen_corpus()
 
     # ── Build policy ────────────────────────────────
-    policy = SchedulingPolicy(node_feat_dim=15).to(device)
+    policy = SchedulingPolicy(node_feat_dim=20).to(device)
 
     if from_scratch:
         # Random init — no weight surgery
@@ -891,26 +906,26 @@ def _get_latency(episode: int) -> int:
     return lat
 
 
-def configure_stratified_optimizer(policy, base_lr: float = 2e-5):
+def configure_stratified_optimizer(policy, base_lr: float = 5e-4):
     """
     Construct an Adam optimizer with geometrically decaying learning rates
     from the output priority heads down to the foundational input layer.
 
-    All 598,786 parameters are trainable from episode 1. Each GAT layer
-    learns at a fraction of the base LR, with Layer 0 (closest to input)
-    at 0.05x and Layer 3 (closest to head) at 0.5x. The priority head
-    and input projection get the full 1.0x base LR.
+    Supports both SchedulingPolicy (4-layer GATv1) and
+    HierarchicalSchedulingPolicy (3+3 layer GATv2 with local/global branches).
 
-    This replaces the hard freeze/thaw progressive unfreeze with a smooth
-    velocity gradient across the network depth, preventing gradient cliffs
-    while allowing every layer to absorb spill-aware representations.
+    For SchedulingPolicy (4-layer GATv1):
+        Heads (input_proj + priority_head): 1.0x -> 5e-4
+        Layer 3 (closest to head):          0.5x -> 2.5e-4
+        Layer 2:                            0.25x -> 1.25e-4
+        Layer 1:                            0.1x -> 5e-5
+        Layer 0 (closest to input):         0.05x -> 2.5e-5
 
-    LR multiplier schedule:
-        Heads (input_proj + priority_head): 1.0x -> {base_lr:.0e}
-        Layer 3 (closest to head):          0.5x -> {base_lr*0.5:.0e}
-        Layer 2:                            0.25x -> {base_lr*0.25:.0e}
-        Layer 1:                            0.1x -> {base_lr*0.1:.0e}
-        Layer 0 (closest to input):         0.05x -> {base_lr*0.05:.0e}
+    For HierarchicalSchedulingPolicy (3+3 layer GATv2):
+        Heads (input_proj + priority_head): 1.0x
+        fusion:                             0.8x
+        local layers 2->1->0:             0.6x, 0.4x, 0.2x
+        global layers 2->1->0:            0.6x, 0.4x, 0.2x
     """
     # Ensure all parameters are trainable
     for param in policy.parameters():
@@ -918,26 +933,63 @@ def configure_stratified_optimizer(policy, base_lr: float = 2e-5):
 
     param_groups = []
 
-    # Group 1: Heads (input_proj + priority_head) — full velocity
-    head_params = list(policy.input_proj.parameters()) + list(policy.priority_head.parameters())
-    param_groups.append({"params": head_params, "lr": base_lr * 1.0})
+    if isinstance(policy, HierarchicalSchedulingPolicy):
+        # ── Hierarchical GATv2 optimizer ──────────────
+        # Heads: full velocity
+        head_params = (list(policy.input_proj.parameters()) +
+                       list(policy.priority_head.parameters()))
+        param_groups.append({"params": head_params, "lr": base_lr * 1.0})
 
-    # Groups 2-5: GAT layers with geometrically decaying LR
-    # Both gat_convs (GATConv) and gat_lin (Linear) per layer
-    lr_scales = {3: 0.5, 2: 0.25, 1: 0.1, 0: 0.05}
-    for layer_idx in [3, 2, 1, 0]:
-        layer_params = []
-        layer_params.extend(list(policy.gat_convs[layer_idx].parameters()))
-        layer_params.extend(list(policy.gat_lin[layer_idx].parameters()))
-        param_groups.append({
-            "params": layer_params,
-            "lr": base_lr * lr_scales[layer_idx],
-        })
+        # Fusion layer
+        param_groups.append({"params": list(policy.fusion.parameters()),
+                             "lr": base_lr * 0.8})
+
+        # Local branch layers (3 layers, layer 2 closest to fusion)
+        local_scales = [0.6, 0.4, 0.2]  # layer 2, 1, 0
+        for layer_idx in range(policy.num_local_layers):
+            layer_params = []
+            layer_params.extend(list(policy.local_convs[layer_idx].parameters()))
+            layer_params.extend(list(policy.local_lin[layer_idx].parameters()))
+            scale = local_scales[layer_idx] if layer_idx < len(local_scales) else 0.1
+            param_groups.append({
+                "params": layer_params,
+                "lr": base_lr * scale,
+            })
+
+        # Global branch layers (3 layers, layer 2 closest to fusion)
+        global_scales = [0.6, 0.4, 0.2]  # layer 2, 1, 0
+        for layer_idx in range(policy.num_global_layers):
+            layer_params = []
+            layer_params.extend(list(policy.global_convs[layer_idx].parameters()))
+            layer_params.extend(list(policy.global_lin[layer_idx].parameters()))
+            scale = global_scales[layer_idx] if layer_idx < len(global_scales) else 0.1
+            param_groups.append({
+                "params": layer_params,
+                "lr": base_lr * scale,
+            })
+    else:
+        # ── SchedulingPolicy (GATv1) optimizer ────────
+        # Group 1: Heads (input_proj + priority_head) — full velocity
+        head_params = (list(policy.input_proj.parameters()) +
+                       list(policy.priority_head.parameters()))
+        param_groups.append({"params": head_params, "lr": base_lr * 1.0})
+
+        # Groups 2-5: GAT layers with geometrically decaying LR
+        lr_scales = {3: 0.5, 2: 0.25, 1: 0.1, 0: 0.05}
+        for layer_idx in [3, 2, 1, 0]:
+            layer_params = []
+            layer_params.extend(list(policy.gat_convs[layer_idx].parameters()))
+            layer_params.extend(list(policy.gat_lin[layer_idx].parameters()))
+            param_groups.append({
+                "params": layer_params,
+                "lr": base_lr * lr_scales[layer_idx],
+            })
 
     optimizer = torch.optim.Adam(param_groups)
 
     n_total = sum(p.numel() for p in policy.parameters())
-    print(f"  Stratified optimizer: {len(param_groups)} param groups")
+    policy_name = type(policy).__name__
+    print(f"  Stratified optimizer ({policy_name}): {len(param_groups)} param groups")
     for i, pg in enumerate(param_groups):
         n_p = sum(p.numel() for p in pg["params"])
         print(f"    Group {i}: {n_p:>7,} params @ lr={pg['lr']:.0e}")
@@ -972,7 +1024,7 @@ def unfrozen_escalation_train(
     k: int = 2,
     max_registers: int = 3,
     register_penalty_alpha: float = 1.0,
-    learning_rate: float = 2e-5,
+    learning_rate: float = 5e-4,
     entropy_coef: float = 0.05,
     clip_epsilon: float = 0.2,
     ppo_epochs: int = 3,
@@ -986,9 +1038,10 @@ def unfrozen_escalation_train(
 
     Loads the Phase 1 checkpoint and trains all 598K parameters with
     geometrically decaying learning rates across GAT layers. The base LR
-    (2e-5) applies to the priority head and input projection. Each GAT
-    layer below learns at a fraction: Layer 3 at 0.5x, Layer 2 at 0.25x,
-    Layer 1 at 0.1x, Layer 0 at 0.05x.
+    (5e-4) applies to the priority head and input projection. Each GAT
+    layer below learns at a fraction: Layer 3 at 0.5x (2.5e-4),
+    Layer 2 at 0.25x (1.25e-4), Layer 1 at 0.1x (5e-5),
+    Layer 0 at 0.05x (2.5e-5).
 
     Memory latency escalates through three milestones (5c -> 8c -> 10c)
     to create progressively stronger gradient contrast around spill/reload
@@ -1005,11 +1058,11 @@ def unfrozen_escalation_train(
         Ep 1000+:    mem_latency=10 (production-level cache miss)
 
     LR multiplier schedule:
-        Heads:      1.0x base_lr (full velocity for action syntax)
-        Layer 3:    0.5x base_lr
-        Layer 2:    0.25x base_lr
-        Layer 1:    0.1x base_lr
-        Layer 0:    0.05x base_lr (gentle foundation morphing)
+        Heads:      1.0x base_lr (5e-4, full velocity for action syntax)
+        Layer 3:    0.5x base_lr (2.5e-4)
+        Layer 2:    0.25x base_lr (1.25e-4)
+        Layer 1:    0.1x base_lr (5e-5)
+        Layer 0:    0.05x base_lr (2.5e-5, protected floor)
 
     Args:
         checkpoint_path: Path to Phase 1 checkpoint (.pt with 'policy_state_dict').
@@ -1056,7 +1109,7 @@ def unfrozen_escalation_train(
 
     # ── Load Phase 1 checkpoint ─────────────────────
     print(f"  Loading Phase 1 checkpoint: {checkpoint_path}")
-    policy = SchedulingPolicy(node_feat_dim=15).to(device)
+    policy = SchedulingPolicy(node_feat_dim=20).to(device)
     ckpt_data = torch.load(checkpoint_path, map_location=device)
     ckpt_sd = ckpt_data["policy_state_dict"]
     policy.load_state_dict(ckpt_sd)
@@ -1449,6 +1502,1136 @@ def unfrozen_escalation_train(
         "graduated": graduated,
         "baseline_snapshots": baseline_snapshots,
         "latency_schedule": latency_schedule,
+        "final_checkpoint": final_path,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Phase 3: Continuous Curricular Annealing
+# ═══════════════════════════════════════════════════════════════
+
+# ── Continuous annealing: performance-gated difficulty interpolation ──
+# Replaces the discrete CHAOS_PHASES regime structure with a smooth
+# `difficulty_factor ∈ [0.0, 1.0]` driven by the rolling @CPF rate.
+# The environment interpolates continually — no regime transition shocks,
+# no baseline resets, no wasted re-stabilization episodes.
+#
+# As the policy improves (higher @CPF rate), the difficulty automatically
+# escalates: latency rises 5c→10c, more port constraints activate, and
+# stochastic jitter widens. An episode-based floor ensures full chaos
+# by episode 500 even if @CPF stays low.
+#
+# Entropy scales with difficulty: `effective_entropy = 0.05 * (1.0 + df)`
+# giving the policy more exploration slack exactly when it needs it most.
+
+
+BASE_LATENCIES = {"Mul": 3, "Add": 1, "Sub": 1, "Div": 3, "CmpGeZ": 1}
+
+
+def _interpolate_chaos(difficulty_factor: float) -> dict:
+    """
+    Return the chaos config interpolated at a given difficulty_factor [0.0, 1.0].
+
+    All parameters are continuous functions of difficulty_factor:
+    - mem_latency:  linear 5c -> 10c
+    - unit_limit:   step thresholds at df=0.2 (Mul=1), df=0.5 (Add=2), df=0.7 (Div=1)
+    - jitter width: linear 0 -> 2 (widening distribution around base latency)
+    """
+    df = max(0.0, min(1.0, difficulty_factor))
+
+    mem_latency = int(5 + df * 5)  # 5c -> 10c
+
+    # Port limits activate at difficulty thresholds
+    unit_limit = {}
+    if df > 0.2:
+        unit_limit["Mul"] = 1
+    if df > 0.5:
+        unit_limit["Add"] = 2
+    if df > 0.7:
+        unit_limit["Div"] = 1
+
+    # Latency jitter widens linearly with difficulty
+    jitter_radius = int(df * 2)  # 0 at df=0.0, 2 at df=1.0
+    latency_distribution = {}
+    if jitter_radius > 0:
+        for op, base in BASE_LATENCIES.items():
+            if base > 1 or df > 0.6:  # delay jitter for fast ops until mid-chaos
+                low = max(1, base - jitter_radius)
+                high = base + jitter_radius
+                latency_distribution[op] = (low, high)
+
+    return {
+        "mem_latency": mem_latency,
+        "unit_limit": unit_limit,
+        "latency_distribution": latency_distribution,
+    }
+
+
+def chaos_annealing_train(
+    checkpoint_path: str = "checkpoints/phase2_final.pt",
+    num_episodes: int = 2000,
+    k: int = 2,
+    max_registers: int = 3,
+    register_penalty_alpha: float = 1.0,
+    learning_rate: float = 5e-4,
+    entropy_coef: float = 0.05,
+    clip_epsilon: float = 0.2,
+    ppo_epochs: int = 3,
+    log_every: int = 50,
+    save_every: int = 500,
+    checkpoint_dir: str = "checkpoints",
+    device: str = "cpu",
+) -> dict:
+    """
+    Phase 3: Continuous Curricular Annealing.
+
+    Loads the Phase 2 checkpoint and activates the dormant port hazard
+    and stochastic latency infrastructure, but unlike the discrete-regime
+    Phase 3, the difficulty interpolates continuously based on the rolling
+    @CPF performance rate.
+
+    The difficulty_factor ∈ [0.0, 1.0] is computed as:
+        roll_cpf_rate  = rolling @CPF over last 100 episodes
+        df = max(min(1.0, roll_cpf_rate * 2.0), min(1.0, episode / 500))
+
+    The performance-driven component (roll_cpf_rate * 2.0) ensures the
+    environment ramps at the rate of the policy's own improvement.
+    The episode-based floor (episode / 500) guarantees full chaos by
+    episode 500 even if @CPF stays near zero.
+
+    This eliminates regime transition shock entirely:
+    - No baseline clears (EMAs track gradual drift naturally)
+    - No CPF cache invalidations (env changes slowly)
+    - No KL spikes from sudden distribution shifts
+    - Entropy scales dynamically: effective_entropy = entropy_coef * (1.0 + df)
+
+    At df=0.0: No port hazards, deterministic latencies, 5c latency
+    At df=1.0: Mul=1 Add=2 Div=1 ports, all ops stochastic with ±2c jitter, 10c latency
+
+    Args:
+        checkpoint_path: Path to Phase 2 checkpoint.
+        num_episodes: Total training episodes.
+        k: Issue width.
+        max_registers: Physical register limit.
+        register_penalty_alpha: Register pressure penalty multiplier.
+        learning_rate: Base LR for stratified optimizer.
+        entropy_coef: Base entropy coefficient (scaled by 1.0 + difficulty_factor).
+        clip_epsilon: PPO clip range.
+        ppo_epochs: Gradient steps per collected episode.
+        log_every: Metrics logging interval.
+        save_every: Checkpoint saving interval.
+        checkpoint_dir: Directory for checkpoints.
+        device: 'cpu' or 'cuda'.
+
+    Returns:
+        dict with full training telemetry.
+    """
+    import os
+    import numpy as np
+    from itertools import cycle
+
+    print()
+    print("=" * 66)
+    print("  PHASE 3: CONTINUOUS CURRICULAR ANNEALING")
+    print("  Performance-gated difficulty, no regime transitions")
+    print("=" * 66)
+
+    # ── Load Phase 2 checkpoint ─────────────────────
+    corpus = _build_escalation_corpus()
+    print(f"  Corpus: {len(corpus)} graph types ({len([c for c in corpus if c[2]==1])} easy, "
+          f"{len([c for c in corpus if c[2]==2])} medium, "
+          f"{len([c for c in corpus if c[2]==3])} hard)")
+
+    print(f"  Loading Phase 2 checkpoint: {checkpoint_path}")
+    policy = SchedulingPolicy(node_feat_dim=20).to(device)
+    ckpt_data = torch.load(checkpoint_path, map_location=device)
+    ckpt_sd = ckpt_data["policy_state_dict"]
+    policy.load_state_dict(ckpt_sd)
+    print(f"  Policy params: {sum(p.numel() for p in policy.parameters())}")
+
+    # ── Stratified optimizer (fixed base_lr throughout) ──
+    optimizer = configure_stratified_optimizer(policy, base_lr=learning_rate)
+    print(f"  base_entropy={entropy_coef}, clip={clip_epsilon}, PPO epochs={ppo_epochs}")
+    print()
+
+    # ── Progressive pool manager (same as Phase 2) ──
+    GRAD_THRESHOLD = 0.8
+    GRAD_WINDOW = 30
+    TIER_POOL_SIZE = {1: 2, 2: 2, 3: 3}
+
+    active_pool = {}
+    waiting_list = {1: [], 2: [], 3: []}
+
+    for label, g_fn, tier in corpus:
+        waiting_list[tier].append((label, g_fn))
+
+    _next_pool_id = 0
+
+    def _promote_from_tier(tier):
+        nonlocal _next_pool_id
+        if waiting_list[tier]:
+            label, g_fn = waiting_list[tier].pop(0)
+            idx = _next_pool_id
+            _next_pool_id += 1
+            active_pool[idx] = {
+                "label": label,
+                "g_fn": g_fn,
+                "tier": tier,
+                "cpf_hits": [],
+                "eps_on": 0,
+            }
+            print(f"  [Pool] Promoted '{label}' (tier {tier}) to pool (id={idx})")
+            return idx
+        return None
+
+    for tier in [1, 2, 3]:
+        for _ in range(TIER_POOL_SIZE[tier]):
+            _promote_from_tier(tier)
+
+    print(f"  Active pool: {len(active_pool)} graphs")
+    print(f"  Waiting list: {sum(len(v) for v in waiting_list.values())} graphs remaining")
+    print()
+
+    graduated = []
+
+    # ── Training state ──────────────────────────────
+    baselines: Dict[str, RunningBaseline] = {}
+    episode_rewards = []
+    episode_spills = []
+    episode_reloads = []
+    best_reward = -float("inf")
+    deadlock_count = 0
+    n_cpf_beaten = 0
+
+    episode_kl = []
+    cpf_cache: Dict[str, tuple] = {}
+    baseline_snapshots: list = []
+    episode_cpf_rewards = []
+
+    # ── Rolling @CPF buffer for performance gating ──
+    CPF_ROLLING_WINDOW = 100
+    _cpf_hits_buffer = []  # rolling window of per-episode @CPF booleans
+
+    # ── Difficulty history ──────────────────────────
+    difficulty_history = []  # (episode, difficulty_factor) pairs
+
+    # ── Entropy tracking ────────────────────────────
+    current_entropy_coef = entropy_coef
+
+    # ── CPF cache invalidated only when env changes measurably ──
+    _last_cpf_env_key = None  # tuple of (lat, frozenset(unit_limit), frozenset(lat_dist))
+
+    # ── KL-Triggered Adaptive Bump ──────────────────
+    # When KL flatlines below 0.001 for 30+ episodes, the policy has
+    # exhausted its current strategy. A discrete difficulty bump (+0.15)
+    # forces re-exploration, followed by a transient entropy boost.
+    KLLATLINE_THRESHOLD = 0.001
+    KLLATLINE_WINDOW = 30
+    BUMP_STEP = 0.15
+    _kl_window = []           # rolling window of per-episode KL values
+    _kl_flatline_counter = 0  # consecutive episodes with avg KL < threshold
+    _adaptive_bump = 0.0      # cumulative difficulty bump from KL triggers
+    _entropy_boost_remaining = 0  # episodes of boosted entropy after bump
+
+    try:
+        from tqdm import tqdm
+        progress = tqdm(range(num_episodes), desc="Annealing")
+    except ImportError:
+        progress = range(num_episodes)
+
+    for episode in progress:
+        # ═══════════════════════════════════════════════
+        #  Continuous Difficulty Computation
+        # ═══════════════════════════════════════════════
+
+        # Compute rolling @CPF rate
+        roll_cpf = 0.0
+        if _cpf_hits_buffer:
+            roll_cpf = sum(_cpf_hits_buffer) / len(_cpf_hits_buffer)
+
+        # Performance-gated difficulty: 0% @CPF -> df=0, 50% @CPF -> df=1
+        perf_df = min(1.0, roll_cpf * 2.0)
+
+        # Episode-based floor: guarantees full chaos by episode 500
+        ep_floor = min(1.0, episode / 500)
+
+        # Final difficulty factor
+        difficulty_factor = max(perf_df, ep_floor)
+
+        # Interpolate chaos config at this difficulty
+        config = _interpolate_chaos(difficulty_factor)
+        current_lat = config["mem_latency"]
+        current_unit_limit = config["unit_limit"]
+        current_lat_dist = config["latency_distribution"]
+
+        # Apply adaptive bump from KL triggers
+        bumped_df = difficulty_factor + _adaptive_bump
+        effective_df = min(1.0, bumped_df)
+
+        # Re-interpolate at effective difficulty (includes bump)
+        config = _interpolate_chaos(effective_df)
+        current_lat = config["mem_latency"]
+        current_unit_limit = config["unit_limit"]
+        current_lat_dist = config["latency_distribution"]
+        difficulty_factor = effective_df  # use bumped df for logging
+
+        # Dynamic entropy: higher entropy at higher difficulty
+        entropy_boost = 0.1 if _entropy_boost_remaining > 0 else 0.0
+        current_entropy_coef = entropy_coef * (1.0 + difficulty_factor + entropy_boost)
+        if _entropy_boost_remaining > 0:
+            _entropy_boost_remaining -= 1
+
+        # Track difficulty for telemetry
+        if episode == 0 or (episode + 1) % log_every == 0:
+            difficulty_history.append((episode, difficulty_factor, _adaptive_bump))
+
+        # ── Performance-weighted graph sampling ──────
+        if not active_pool:
+            print(f"Ep {episode}: active pool empty — all graphs graduated.")
+            break
+
+        weights = {}
+        for idx, info in active_pool.items():
+            recent = info["cpf_hits"][-GRAD_WINDOW:]
+            mastery = sum(recent) / len(recent) if recent else 0.0
+            weights[idx] = max(0.05, 1.0 - mastery)
+
+        total_w = sum(weights.values())
+        probs = [weights[idx] / total_w for idx in active_pool]
+        rng = np.random.RandomState(episode * 117 + 42)
+        chosen_idx = rng.choice(list(active_pool.keys()), p=probs)
+
+        chosen = active_pool[chosen_idx]
+        chosen["eps_on"] += 1
+        graph = chosen["g_fn"]()
+        topo = graph.get_topological_order()
+        node_names = graph.inputs + topo + graph.outputs
+        label = chosen["label"]
+
+        # ═══════════════════════════════════════════════
+        #  CPF Baseline (continuous recomputation)
+        # ═══════════════════════════════════════════════
+
+        # Build env key to detect meaningful config changes
+        env_key = (
+            current_lat,
+            frozenset(current_unit_limit.items()),
+            frozenset((k, v[0], v[1]) for k, v in sorted(current_lat_dist.items()))
+        )
+
+        if label not in cpf_cache or env_key != _last_cpf_env_key:
+            cpf_sched = schedule_cpf(graph)
+            cpf_env = SchedulingGymEnv(
+                graph, None, [],
+                max_exec_units=k, latency=DEFAULT_LATENCY,
+                max_registers=max_registers,
+                register_penalty_alpha=register_penalty_alpha,
+                mem_latency=current_lat,
+                unit_limit=current_unit_limit,
+                latency_distribution=current_lat_dist,
+            )
+            cpf_env.reset()
+            for nid in cpf_sched:
+                cpf_idx = node_names.index(nid)
+                _, _, cpf_done, cpf_info = cpf_env.step(cpf_idx)
+                if cpf_done:
+                    break
+            cpf_r = cpf_info.get("spill_penalty", 0) + cpf_info.get("cycles", 0)
+            cpf_cyc = cpf_info.get("cycles", 0)
+            cpf_cache[label] = (-cpf_r, cpf_cyc)
+            _last_cpf_env_key = env_key
+
+        cpf_reward, cpf_cycles = cpf_cache[label]
+
+        # ═══════════════════════════════════════════════
+        #  Training Environment
+        # ═══════════════════════════════════════════════
+
+        env = SchedulingGymEnv(
+            graph, None, [],
+            max_exec_units=k, latency=DEFAULT_LATENCY,
+            max_registers=max_registers,
+            register_penalty_alpha=register_penalty_alpha,
+            mem_latency=current_lat,
+            unit_limit=current_unit_limit,
+            latency_distribution=current_lat_dist,
+        )
+
+        # ═══════════════════════════════════════════════
+        #  Per-Label Baseline (never cleared — gradual drift)
+        # ═══════════════════════════════════════════════
+
+        if label not in baselines:
+            baselines[label] = RunningBaseline(alpha=0.9)
+        graph_baseline = baselines[label]
+
+        reward, info = train_scheduling_episode_ppo_v2(
+            env, policy, optimizer, graph_baseline,
+            entropy_coef=current_entropy_coef,
+            reward_scale=1.0,
+            clip_epsilon=clip_epsilon,
+            ppo_epochs=ppo_epochs,
+            device=device,
+            track_kl=True,
+        )
+
+        # ═══════════════════════════════════════════════
+        #  Post-Episode Accounting
+        # ═══════════════════════════════════════════════
+
+        # KL logging + flatline detection
+        if "approx_kl" in info:
+            kl_val = info["approx_kl"]
+            episode_kl.append(kl_val)
+            # Rolling KL window
+            _kl_window.append(kl_val)
+            if len(_kl_window) > KLLATLINE_WINDOW:
+                _kl_window.pop(0)
+            # Flatline check (need at least 5 samples to avoid noise)
+            if len(_kl_window) >= 5 and not _entropy_boost_remaining > 0:
+                avg_kl_window = sum(_kl_window) / len(_kl_window)
+                if avg_kl_window < KLLATLINE_THRESHOLD:
+                    _kl_flatline_counter += 1
+                else:
+                    _kl_flatline_counter = 0
+                # Trigger bump when flatlined for KLLATLINE_WINDOW episodes
+                if _kl_flatline_counter >= KLLATLINE_WINDOW:
+                    _adaptive_bump += BUMP_STEP
+                    _kl_flatline_counter = 0
+                    _entropy_boost_remaining = 10  # 10 episodes of boosted entropy
+                    print(f"  ** KL TRIGGER ep {episode:4d}: bump +{BUMP_STEP:.2f} "
+                          f"(total={_adaptive_bump:.2f}, entropy_boost=10eps)")
+
+        # Extract spill/reload counts
+        n_spills = sum(1 for e in env.schedule
+                       if isinstance(e, tuple) and e[0] == "spill")
+        n_reloads = sum(1 for e in env.schedule
+                        if isinstance(e, tuple) and e[0] == "reload")
+
+        episode_rewards.append(reward)
+        episode_spills.append(n_spills)
+        episode_reloads.append(n_reloads)
+
+        if reward > best_reward:
+            best_reward = reward
+        if reward <= -900:
+            deadlock_count += 1
+
+        episode_cpf_rewards.append(cpf_reward)
+        if reward >= cpf_reward:
+            n_cpf_beaten += 1
+            chosen["cpf_hits"].append(1)
+            _cpf_hits_buffer.append(1)
+        else:
+            chosen["cpf_hits"].append(0)
+            _cpf_hits_buffer.append(0)
+
+        # Maintain rolling buffer size
+        if len(_cpf_hits_buffer) > CPF_ROLLING_WINDOW:
+            _cpf_hits_buffer.pop(0)
+
+        # ── Graduation check ────────────────────────
+        recent_hits = chosen["cpf_hits"][-GRAD_WINDOW:]
+        if len(recent_hits) >= GRAD_WINDOW:
+            mastery = sum(recent_hits) / GRAD_WINDOW
+            if mastery >= GRAD_THRESHOLD and chosen["eps_on"] >= GRAD_WINDOW:
+                graduated.append((episode, chosen["label"], chosen["tier"], mastery))
+                del active_pool[chosen_idx]
+                print(
+                    f"  Ep {episode:4d}: GRADUATED '{chosen['label']}' "
+                    f"(tier {chosen['tier']}, mastery={mastery:.0%})"
+                )
+                _promote_from_tier(chosen["tier"])
+                if chosen["label"] in cpf_cache:
+                    del cpf_cache[chosen["label"]]
+
+        # ═══════════════════════════════════════════════
+        #  Logging
+        # ═══════════════════════════════════════════════
+
+        if (episode + 1) % log_every == 0 or episode < 5:
+            recent_r = episode_rewards[-min(log_every, len(episode_rewards)):]
+            avg_r = sum(recent_r) / len(recent_r)
+            avg_s = (sum(episode_spills[-min(log_every, len(episode_spills)):])
+                     / min(log_every, len(episode_spills)))
+            avg_kl = sum(episode_kl[-min(log_every, len(episode_kl)):]) / min(log_every, len(episode_kl)) if episode_kl else 0.0
+
+            pool_mastery = {
+                info["label"]: (
+                    sum(info["cpf_hits"][-GRAD_WINDOW:]) / len(info["cpf_hits"][-GRAD_WINDOW:])
+                    if len(info["cpf_hits"]) >= GRAD_WINDOW else 0.0
+                )
+                for info in active_pool.values()
+            }
+
+            # ── Baseline snapshot ──
+            if (episode + 1) % log_every == 0 and baselines:
+                snapshot = {
+                    "ep": episode + 1,
+                    "mem_lat": current_lat,
+                    "difficulty": round(difficulty_factor, 3),
+                    "bump": round(_adaptive_bump, 3),
+                    "kl_flatline": _kl_flatline_counter,
+                    "entropy": current_entropy_coef,
+                    "roll_cpf": round(roll_cpf, 3),
+                    "unit_limit": dict(current_unit_limit),
+                    "lat_dist": {
+                        k: v for k, v in sorted(current_lat_dist.items())
+                    },
+                    "baselines": {
+                        lbl: bl.get() for lbl, bl in sorted(baselines.items())
+                    },
+                }
+                baseline_snapshots.append(snapshot)
+
+            if isinstance(progress, range):
+                bolt_indicator = " ⚡" if _entropy_boost_remaining > 0 else "   "
+                print(
+                    f"  Ep {episode + 1:4d}/{num_episodes} | "
+                    f"reward={avg_r:7.1f} | "
+                    f"lat={current_lat:2d}c | "
+                    f"df={difficulty_factor:.2f}{bolt_indicator} | "
+                    f"kl={avg_kl:.4f} | "
+                    f"spills={avg_s:.1f}/ep | "
+                    f"pool={len(active_pool)}g | "
+                    f"grad={len(graduated)} | "
+                    f"dead={deadlock_count:3d} | "
+                    f"{chosen['label']}"
+                )
+                if pool_mastery and (episode + 1) % (log_every * 2) == 0:
+                    mastery_str = " | ".join(
+                        f"{k}={v:.0%}" for k, v in sorted(pool_mastery.items())
+                    )
+                    print(f"         mastery: {mastery_str}")
+                    bl_str = " | ".join(
+                        f"bl:{k}={baselines[k].get():.0f}"
+                        for k in sorted(pool_mastery.keys())
+                        if k in baselines
+                    )
+                    if bl_str:
+                        print(f"         {bl_str}")
+            else:
+                progress.set_postfix({
+                    "avg": f"{avg_r:.1f}",
+                    "lat": current_lat,
+                    "df": f"{difficulty_factor:.2f}",
+                    "kl": f"{avg_kl:.4f}",
+                    "pool": len(active_pool),
+                    "grad": len(graduated),
+                    "dead": deadlock_count,
+                })
+
+        # ── Save checkpoint ──────────────────────────
+        if (episode + 1) % save_every == 0:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            ckpt_path = os.path.join(
+                checkpoint_dir,
+                f"phase3_ep{episode + 1}.pt",
+            )
+            torch.save({
+                "policy_state_dict": policy.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "phase": 3,
+                "episode": episode + 1,
+                "rewards": episode_rewards,
+                "spill_counts": episode_spills,
+                "reload_counts": episode_reloads,
+                "best_reward": best_reward,
+                "graduated": graduated,
+                "baseline_snapshots": baseline_snapshots,
+                "difficulty_history": difficulty_history,
+                "config": {
+                    "k": k,
+                    "max_registers": max_registers,
+                    "register_penalty_alpha": register_penalty_alpha,
+                    "learning_rate": learning_rate,
+                    "entropy_coef": entropy_coef,
+                    "clip_epsilon": clip_epsilon,
+                    "ppo_epochs": ppo_epochs,
+                },
+            }, ckpt_path)
+            print(f"  [Checkpoint] {ckpt_path}")
+
+    # ── Final summary ────────────────────────────────
+    last_200 = episode_rewards[-200:] if len(episode_rewards) >= 200 else episode_rewards
+    avg_last = sum(last_200) / len(last_200)
+    total_spills = sum(episode_spills)
+    total_reloads = sum(episode_reloads)
+
+    print()
+    print(f"  PHASE 3 (ANNEALING) COMPLETE")
+    print(f"  {'=' * 40}")
+    print(f"  Best reward:     {best_reward:7.1f}")
+    print(f"  Avg last 200:    {avg_last:7.1f}")
+    print(f"  Deadlocks:       {deadlock_count:4d}/{num_episodes}")
+    print(f"  @CPF beaten:     {n_cpf_beaten:4d}/{num_episodes}")
+    print(f"  Graphs graduated:{len(graduated):4d}")
+    print(f"  Total spills:    {total_spills:4d}")
+    print(f"  Total reloads:   {total_reloads:4d}")
+
+    if difficulty_history:
+        df_at_start = difficulty_history[0][1]
+        df_at_end = difficulty_history[-1][1]
+        print(f"  Difficulty:      {df_at_start:.2f} -> {df_at_end:.2f} "
+              f"(target={roll_cpf:.3f} roll @CPF)")
+
+    if graduated:
+        print(f"  Graduated graphs:")
+        for ep, lbl, tier, mas in graduated:
+            print(f"    Ep {ep:4d}: {lbl:20s} (tier {tier}, mastery={mas:.0%})")
+
+    # ── Save final model ─────────────────────────────
+    final_path = os.path.join(checkpoint_dir, "phase3_final.pt")
+    torch.save({
+        "policy_state_dict": policy.state_dict(),
+        "phase": 3,
+        "episode": num_episodes,
+        "rewards": episode_rewards,
+        "spill_counts": episode_spills,
+        "reload_counts": episode_reloads,
+        "best_reward": best_reward,
+        "graduated": graduated,
+        "baseline_snapshots": baseline_snapshots,
+        "difficulty_history": difficulty_history,
+        "config": {},
+    }, final_path)
+    print(f"  Final checkpoint: {final_path}")
+
+    return {
+        "rewards": episode_rewards,
+        "spill_counts": episode_spills,
+        "reload_counts": episode_reloads,
+        "best_reward": best_reward,
+        "deadlock_count": deadlock_count,
+        "n_cpf_beaten": n_cpf_beaten,
+        "graduated": graduated,
+        "baseline_snapshots": baseline_snapshots,
+        "difficulty_history": difficulty_history,
+        "final_checkpoint": final_path,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Phase 4: Hierarchical GATv2 Training (Burn-in + Scaled Chaos)
+# ═══════════════════════════════════════════════════════════════
+
+
+def _build_hierarchical_burnin_corpus():
+    """
+    Build a burn-in corpus for HierarchicalSchedulingPolicy.
+    Uses small Phase 4 graphs (3-5 lanes x 2-3 ops = 6-15 ops) to
+    stabilize the local/global branch norms before scaling up.
+    """
+    from .graph_generator import ProceduralGraphGenerator
+    gen = ProceduralGraphGenerator(seed=42)
+    return [
+        (f"Phase4_burnin_{i}", lambda i=i: gen.generate(phase=4))
+        for i in range(10)
+    ]
+
+
+def _build_hierarchical_scaled_corpus():
+    """
+    Build a scaled-up corpus for HierarchicalSchedulingPolicy.
+    Uses Phase 5 graphs (8-20 lanes x 3-8 ops = 50-160 ops) with
+    the same parallel lane topology as Phase 4, scaled 10x.
+    """
+    from .graph_generator import ProceduralGraphGenerator
+    gen = ProceduralGraphGenerator(seed=117)
+    return [
+        (f"Phase5_scaled_{i}", lambda i=i: gen.generate(phase=5))
+        for i in range(15)
+    ]
+
+
+def hierarchical_phase4_train(
+    num_episodes: int = 2000,
+    burnin_episodes: int = 100,
+    k: int = 2,
+    max_registers: int = 3,
+    register_penalty_alpha: float = 1.0,
+    learning_rate: float = 5e-4,
+    entropy_coef: float = 0.05,
+    burnin_entropy_coef: float = 0.08,
+    clip_epsilon: float = 0.2,
+    ppo_epochs: int = 3,
+    log_every: int = 25,
+    save_every: int = 250,
+    checkpoint_dir: str = "checkpoints",
+    device: str = "cpu",
+    dry_run: bool = False,
+) -> dict:
+    """
+    Phase 4: Hierarchical GATv2 Training with Burn-in + Scaled Chaos.
+
+    Initializes HierarchicalSchedulingPolicy from scratch and runs a
+    100-episode deterministic burn-in on small Phase 4 graphs to
+    stabilize the local/global branch norm ratio. Once the ratio is
+    stable in [0.5, 2.0], promotes to scaled Phase 5 graphs (50-160 ops)
+    with continuous curricular annealing + adaptive solenoid.
+
+    Burn-in phase (eps 0-99):
+      - Small Phase 4 graphs (3-5 lanes x 2-3 ops = 6-15 ops)
+      - mem_latency = 3c (deterministic)
+      - No port hazards, no jitter
+      - Higher entropy (0.08 for eps 0-49, 0.05 for eps 50-99)
+      - Track branch_norm_ratio every log interval
+
+    Promotion check (at ep 100):
+      - If branch_norm_ratio in [0.5, 2.0] for last 30 episodes -> promote
+      - Otherwise -> extend burn-in by 50 episodes, re-check
+
+    Scaled phase (eps 100+):
+      - Phase 5 graphs (8-20 lanes x 3-8 ops = 50-160 ops)
+      - Continuous annealing via _interpolate_chaos()
+      - Adaptive solenoid (KL-triggered bumps)
+      - Dynamic entropy scaling
+
+    Args:
+        num_episodes: Total training episodes.
+        burnin_episodes: Episodes in deterministic burn-in phase.
+        k: Issue width.
+        max_registers: Physical register limit.
+        register_penalty_alpha: Register pressure penalty multiplier.
+        learning_rate: Base LR for stratified optimizer.
+        entropy_coef: Base entropy coefficient (scaled chaos phase).
+        burnin_entropy_coef: Entropy coefficient during burn-in.
+        clip_epsilon: PPO clip range.
+        ppo_epochs: Gradient steps per collected episode.
+        log_every: Metrics logging interval.
+        save_every: Checkpoint saving interval.
+        checkpoint_dir: Directory for checkpoints.
+        device: 'cpu' or 'cuda'.
+
+    Returns:
+        dict with full training telemetry including branch norms.
+    """
+    import os
+    import numpy as np
+
+    print()
+    print("=" * 66)
+    print("  PHASE 4: HIERARCHICAL GATv2 TRAINING")
+    print("  100-ep burn-in -> scaled 50-160 op chaos")
+    print("=" * 66)
+
+    # ── Build corpora ──────────────────────────────
+    burnin_corpus = _build_hierarchical_burnin_corpus()
+    scaled_corpus = _build_hierarchical_scaled_corpus()
+    print(f"  Burn-in corpus: {len(burnin_corpus)} graph types (6-15 ops each)")
+    print(f"  Scaled corpus:  {len(scaled_corpus)} graph types (50-160 ops each)")
+
+    # ── Initialize policy from scratch ──────────────
+    policy = HierarchicalSchedulingPolicy(node_feat_dim=20).to(device)
+    n_params = sum(p.numel() for p in policy.parameters())
+    print(f"  Policy: HierarchicalSchedulingPolicy ({n_params:,} params)")
+
+    # ── Stratified optimizer ────────────────────────
+    optimizer = configure_stratified_optimizer(policy, base_lr=learning_rate)
+    print(f"  base_lr={learning_rate}, burnin_entropy={burnin_entropy_coef}, "
+          f"entropy={entropy_coef}")
+    print(f"  clip={clip_epsilon}, PPO epochs={ppo_epochs}")
+    if dry_run:
+        print(f"  DRY RUN: 5 episodes (3 burn-in + 2 chaos) to validate memory footprint")
+    print()
+
+    # ── Dry run: override to 5 episodes ────────────
+    if dry_run:
+        num_episodes = 5
+        save_every = 99999  # effectively disable checkpoint saving
+
+    # ── Training state ──────────────────────────────
+    baselines: Dict[str, RunningBaseline] = {}
+    episode_rewards = []
+    episode_spills = []
+    episode_reloads = []
+    best_reward = -float("inf")
+    deadlock_count = 0
+    n_cpf_beaten = 0
+
+    episode_kl = []
+    episode_cpf_rewards = []
+    branch_norm_history = []  # (ep, local_norm, global_norm, ratio)
+    reduction_attn_history = []  # (ep, red_global_norm, nonred_global_norm, ratio)
+
+    # ── Burn-in phase: deterministic 3c, small graphs ──
+    in_burnin = True
+    promoted_ep = None
+    burnin_extension = 0
+
+    # ── Scaled phase: adaptive solenoid state ────────
+    _cpf_hits_buffer = []
+    difficulty_history = []
+    current_entropy_coef = entropy_coef
+    _last_cpf_env_key = None
+    cpf_cache: Dict[str, tuple] = {}
+
+    KLLATLINE_THRESHOLD = 0.001
+    KLLATLINE_WINDOW = 30
+    BUMP_STEP = 0.15
+    _kl_window = []
+    _kl_flatline_counter = 0
+    _adaptive_bump = 0.0
+    _entropy_boost_remaining = 0
+
+    # ── Graph rotation: deterministic sequence ──────
+    burnin_idx = 0
+    scaled_idx = 0
+
+    try:
+        from tqdm import tqdm
+        progress = tqdm(range(num_episodes), desc="Phase 4")
+    except ImportError:
+        progress = range(num_episodes)
+
+    for episode in progress:
+        # ═══════════════════════════════════════════════
+        #  Phase Detection
+        # ═══════════════════════════════════════════════
+
+        if in_burnin and episode >= burnin_episodes + burnin_extension:
+            # Check promotion condition
+            recent_ratios = [
+                r for _, _, _, r in branch_norm_history[-30:]
+            ] if len(branch_norm_history) >= 30 else []
+            if recent_ratios:
+                min_r, max_r = min(recent_ratios), max(recent_ratios)
+                if 0.5 <= min_r and max_r <= 2.0:
+                    in_burnin = False
+                    promoted_ep = episode
+                    print(f"\n  === PROMOTED at ep {episode}: "
+                          f"branch_norm_ratio [{min_r:.3f}, {max_r:.3f}] -> scaled chaos ===\n")
+                else:
+                    burnin_extension += 50
+                    print(f"  [Burn-in] Extended by 50 eps: "
+                          f"ratio [{min_r:.3f}, {max_r:.3f}] not in [0.5, 2.0]")
+
+        # ═══════════════════════════════════════════════
+        #  Environment Config
+        # ═══════════════════════════════════════════════
+
+        if in_burnin:
+            # Deterministic burn-in
+            current_lat = 3
+            current_unit_limit = {}
+            current_lat_dist = {}
+            label, g_fn = burnin_corpus[burnin_idx % len(burnin_corpus)]
+            burnin_idx += 1
+
+            # Higher entropy for first 50 burn-in episodes
+            if episode < 50:
+                current_entropy_coef = burnin_entropy_coef
+            else:
+                current_entropy_coef = entropy_coef
+        else:
+            # Scaled chaos phase: continuous annealing
+            roll_cpf = 0.0
+            if _cpf_hits_buffer:
+                roll_cpf = sum(_cpf_hits_buffer) / len(_cpf_hits_buffer)
+
+            perf_df = min(1.0, roll_cpf * 2.0)
+            ep_floor = min(1.0, (episode - promoted_ep) / 500)
+            difficulty_factor = max(perf_df, ep_floor)
+
+            config = _interpolate_chaos(difficulty_factor)
+            current_lat = config["mem_latency"]
+            current_unit_limit = config["unit_limit"]
+            current_lat_dist = config["latency_distribution"]
+
+            # Apply adaptive bump
+            bumped_df = difficulty_factor + _adaptive_bump
+            effective_df = min(1.0, bumped_df)
+            config = _interpolate_chaos(effective_df)
+            current_lat = config["mem_latency"]
+            current_unit_limit = config["unit_limit"]
+            current_lat_dist = config["latency_distribution"]
+            difficulty_factor = effective_df
+
+            entropy_boost = 0.1 if _entropy_boost_remaining > 0 else 0.0
+            current_entropy_coef = entropy_coef * (1.0 + difficulty_factor + entropy_boost)
+            if _entropy_boost_remaining > 0:
+                _entropy_boost_remaining -= 1
+
+            # Scaled graph sampling
+            label, g_fn = scaled_corpus[scaled_idx % len(scaled_corpus)]
+            scaled_idx += 1
+
+            if episode == promoted_ep or (episode + 1 - promoted_ep) % log_every == 0:
+                difficulty_history.append(
+                    (episode, difficulty_factor, _adaptive_bump)
+                )
+
+        # ═══════════════════════════════════════════════
+        #  Graph + CPF
+        # ═══════════════════════════════════════════════
+
+        graph = g_fn()
+        topo = graph.get_topological_order()
+        node_names = graph.inputs + topo + graph.outputs
+
+        # CPF baseline
+        cpf_key = f"{label}_{current_lat}_{current_unit_limit}_{sorted(current_lat_dist.items())}"
+        if cpf_key not in cpf_cache or (not in_burnin and cpf_key != _last_cpf_env_key):
+            cpf_sched = schedule_cpf(graph)
+            cpf_env = SchedulingGymEnv(
+                graph, None, [],
+                max_exec_units=k, latency=DEFAULT_LATENCY,
+                max_registers=max_registers,
+                register_penalty_alpha=register_penalty_alpha,
+                mem_latency=current_lat,
+                unit_limit=current_unit_limit,
+                latency_distribution=current_lat_dist,
+            )
+            cpf_env.reset()
+            for nid in cpf_sched:
+                cpf_idx = node_names.index(nid)
+                _, _, cpf_done, cpf_info = cpf_env.step(cpf_idx)
+                if cpf_done:
+                    break
+            cpf_r = cpf_info.get("spill_penalty", 0) + cpf_info.get("cycles", 0)
+            cpf_cache[cpf_key] = -cpf_r
+            _last_cpf_env_key = cpf_key
+
+        cpf_reward = cpf_cache[cpf_key]
+
+        # ═══════════════════════════════════════════════
+        #  Training Environment
+        # ═══════════════════════════════════════════════
+
+        env = SchedulingGymEnv(
+            graph, None, [],
+            max_exec_units=k, latency=DEFAULT_LATENCY,
+            max_registers=max_registers,
+            register_penalty_alpha=register_penalty_alpha,
+            mem_latency=current_lat,
+            unit_limit=current_unit_limit,
+            latency_distribution=current_lat_dist,
+        )
+
+        # ═══════════════════════════════════════════════
+        #  Per-Label Baseline
+        # ═══════════════════════════════════════════════
+
+        if label not in baselines:
+            baselines[label] = RunningBaseline(alpha=0.9)
+        graph_baseline = baselines[label]
+
+        reward, info = train_scheduling_episode_ppo_v2(
+            env, policy, optimizer, graph_baseline,
+            entropy_coef=current_entropy_coef,
+            reward_scale=1.0,
+            clip_epsilon=clip_epsilon,
+            ppo_epochs=ppo_epochs,
+            device=device,
+            track_kl=True,
+        )
+
+        # ═══════════════════════════════════════════════
+        #  Post-Episode Accounting
+        # ═══════════════════════════════════════════════
+
+        if "approx_kl" in info:
+            kl_val = info["approx_kl"]
+            episode_kl.append(kl_val)
+            if not in_burnin:
+                _kl_window.append(kl_val)
+                if len(_kl_window) > KLLATLINE_WINDOW:
+                    _kl_window.pop(0)
+                if len(_kl_window) >= 5 and _entropy_boost_remaining <= 0:
+                    avg_kl_window = sum(_kl_window) / len(_kl_window)
+                    if avg_kl_window < KLLATLINE_THRESHOLD:
+                        _kl_flatline_counter += 1
+                    else:
+                        _kl_flatline_counter = 0
+                    if _kl_flatline_counter >= KLLATLINE_WINDOW:
+                        _adaptive_bump += BUMP_STEP
+                        _kl_flatline_counter = 0
+                        _entropy_boost_remaining = 10
+                        print(f"  ** KL TRIGGER ep {episode:4d}: bump +{BUMP_STEP:.2f} "
+                              f"(total={_adaptive_bump:.2f}, entropy_boost=10eps)")
+
+        # Branch norm tracking (hierarchical policy always provides this)
+        if "branch_norm_ratio" in info:
+            branch_norm_history.append((
+                episode,
+                info.get("branch_local_norm", 0),
+                info.get("branch_global_norm", 0),
+                info["branch_norm_ratio"],
+            ))
+        # Reduction-node attention tracking
+        if "red_attn_ratio" in info:
+            reduction_attn_history.append((
+                episode,
+                info.get("red_global_norm", 0),
+                info.get("nonred_global_norm", 0),
+                info["red_attn_ratio"],
+            ))
+
+        n_spills = sum(1 for e in env.schedule
+                       if isinstance(e, tuple) and e[0] == "spill")
+        n_reloads = sum(1 for e in env.schedule
+                        if isinstance(e, tuple) and e[0] == "reload")
+
+        episode_rewards.append(reward)
+        episode_spills.append(n_spills)
+        episode_reloads.append(n_reloads)
+
+        if reward > best_reward:
+            best_reward = reward
+        if reward <= -900:
+            deadlock_count += 1
+
+        episode_cpf_rewards.append(cpf_reward)
+        if reward >= cpf_reward:
+            n_cpf_beaten += 1
+            if not in_burnin:
+                _cpf_hits_buffer.append(1)
+                if len(_cpf_hits_buffer) > 100:
+                    _cpf_hits_buffer.pop(0)
+            # else: not tracked during burn-in (deterministic)
+        elif not in_burnin:
+            _cpf_hits_buffer.append(0)
+            if len(_cpf_hits_buffer) > 100:
+                _cpf_hits_buffer.pop(0)
+
+        # ═══════════════════════════════════════════════
+        #  Logging
+        # ═══════════════════════════════════════════════
+
+        if (episode + 1) % log_every == 0 or episode < 5:
+            recent_r = episode_rewards[-min(log_every, len(episode_rewards)):]
+            avg_r = sum(recent_r) / len(recent_r)
+            avg_s = (sum(episode_spills[-min(log_every, len(episode_spills)):])
+                     / min(log_every, len(episode_spills)))
+            avg_kl = (sum(episode_kl[-min(log_every, len(episode_kl)):])
+                      / min(log_every, len(episode_kl))) if episode_kl else 0.0
+
+            # Branch norm ratio
+            ratio_str = ""
+            if branch_norm_history:
+                last_ratio = branch_norm_history[-1][3]
+                ratio_str = f" | br={last_ratio:.3f}"
+
+            phase_tag = "BURNIN" if in_burnin else "CHAOS"
+            ops_tag = "~10" if in_burnin else "~100"
+
+            if isinstance(progress, range):
+                bolt_indicator = " ⚡" if _entropy_boost_remaining > 0 else "   "
+                df_str = "" if in_burnin else f"df={difficulty_factor:.2f}{bolt_indicator}"
+                print(
+                    f"  Ep {episode + 1:4d}/{num_episodes} "
+                    f"[{phase_tag:6s}] | "
+                    f"reward={avg_r:7.1f} | "
+                    f"ops={ops_tag:>4s} | "
+                    f"kl={avg_kl:.4f}{ratio_str} | "
+                    f"spills={avg_s:.1f}/ep | "
+                    f"dead={deadlock_count:3d} | "
+                    f"{label}"
+                )
+                if df_str:
+                    print(f"         {df_str}")
+            else:
+                progress.set_postfix({
+                    "phase": phase_tag,
+                    "avg": f"{avg_r:.1f}",
+                    "ratio": f"{last_ratio:.3f}" if branch_norm_history else "-",
+                    "dead": deadlock_count,
+                })
+
+        # ═══════════════════════════════════════════════
+        #  Save Checkpoint
+        # ═══════════════════════════════════════════════
+
+        if (episode + 1) % save_every == 0:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            ckpt_path = os.path.join(
+                checkpoint_dir,
+                f"phase4_ep{episode + 1}.pt",
+            )
+            torch.save({
+                "policy_state_dict": policy.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "phase": 4,
+                "episode": episode + 1,
+                "in_burnin": in_burnin,
+                "promoted_ep": promoted_ep,
+                "rewards": episode_rewards,
+                "spill_counts": episode_spills,
+                "reload_counts": episode_reloads,
+                "best_reward": best_reward,
+                "branch_norm_history": branch_norm_history,
+                "reduction_attn_history": reduction_attn_history,
+                "difficulty_history": difficulty_history,
+                "config": {
+                    "k": k,
+                    "max_registers": max_registers,
+                    "register_penalty_alpha": register_penalty_alpha,
+                    "learning_rate": learning_rate,
+                    "entropy_coef": entropy_coef,
+                    "burnin_entropy_coef": burnin_entropy_coef,
+                    "clip_epsilon": clip_epsilon,
+                    "ppo_epochs": ppo_epochs,
+                },
+            }, ckpt_path)
+            print(f"  [Checkpoint] {ckpt_path}")
+
+    # ── Final summary ────────────────────────────────
+    last_200 = episode_rewards[-200:] if len(episode_rewards) >= 200 else episode_rewards
+    avg_last = sum(last_200) / len(last_200)
+    total_spills = sum(episode_spills)
+    total_reloads = sum(episode_reloads)
+
+    print()
+    print(f"  PHASE 4 COMPLETE")
+    print(f"  {'=' * 40}")
+    print(f"  Best reward:       {best_reward:7.1f}")
+    print(f"  Avg last 200:      {avg_last:7.1f}")
+    print(f"  Deadlocks:         {deadlock_count:4d}/{num_episodes}")
+    print(f"  @CPF beaten:       {n_cpf_beaten:4d}/{num_episodes}")
+    print(f"  Total spills:      {total_spills:4d}")
+    print(f"  Total reloads:     {total_reloads:4d}")
+    print(f"  Promoted at ep:    {promoted_ep if promoted_ep else 'NEVER'}")
+
+    if branch_norm_history:
+        first_ratio = branch_norm_history[0][3]
+        last_ratio = branch_norm_history[-1][3]
+        print(f"  Branch norm ratio: {first_ratio:.3f} -> {last_ratio:.3f}")
+
+    if difficulty_history:
+        df_start = difficulty_history[0][1]
+        df_end = difficulty_history[-1][1]
+        roll_cpf = (sum(_cpf_hits_buffer) / len(_cpf_hits_buffer)
+                     if _cpf_hits_buffer else 0.0)
+        print(f"  Difficulty:        {df_start:.2f} -> {df_end:.2f} "
+              f"(roll @CPF={roll_cpf:.3f})")
+
+    # ── Save final model ─────────────────────────────
+    final_path = os.path.join(checkpoint_dir, "phase4_final.pt")
+    torch.save({
+        "policy_state_dict": policy.state_dict(),
+        "phase": 4,
+        "episode": num_episodes,
+        "promoted_ep": promoted_ep,
+        "rewards": episode_rewards,
+        "spill_counts": episode_spills,
+        "reload_counts": episode_reloads,
+        "best_reward": best_reward,
+        "branch_norm_history": branch_norm_history,
+        "difficulty_history": difficulty_history,
+        "config": {"policy_type": "HierarchicalSchedulingPolicy"},
+    }, final_path)
+    print(f"  Final checkpoint: {final_path}")
+
+    return {
+        "rewards": episode_rewards,
+        "spill_counts": episode_spills,
+        "reload_counts": episode_reloads,
+        "best_reward": best_reward,
+        "deadlock_count": deadlock_count,
+        "n_cpf_beaten": n_cpf_beaten,
+        "promoted_ep": promoted_ep,
+        "branch_norm_history": branch_norm_history,
+        "difficulty_history": difficulty_history,
         "final_checkpoint": final_path,
     }
 

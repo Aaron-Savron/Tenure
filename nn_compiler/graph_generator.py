@@ -62,6 +62,16 @@ PHASE_CONFIG = {
         "allow_skip": False,
         "terminal_op": [NodeType.ADD, NodeType.MUL],  # how lanes recombine
     },
+    5: {  # Wide Parallel Lanes (100+ op scaling curriculum)
+        "num_inputs": (4, 10),
+        "num_lanes": (8, 20),
+        "ops_per_lane": (3, 8),
+        "op_pool": [NodeType.ADD, NodeType.MUL],
+        "max_fanout": 5,
+        "allow_conditional": False,
+        "allow_skip": False,
+        "terminal_op": [NodeType.ADD, NodeType.MUL],
+    },
 }
 
 
@@ -207,9 +217,9 @@ class ProceduralGraphGenerator:
             op_counter[base] = op_counter.get(base, 0) + 1
             return f"{base}{op_counter[base] - 1}"
 
-        # ── Phase 4: parallel lane topology ────────────
-        # Phase 4 creates all inputs internally; skip outer input creation.
-        if phase == 4:
+        # ── Phase 4/5: parallel lane topology ────────────
+        # Phase 4/5 creates all inputs internally; skip outer input creation.
+        if phase in (4, 5):
             return self._generate_phase4(config, _node_name)
 
         # ── Create input nodes ──────────────────────────
