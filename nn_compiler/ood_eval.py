@@ -66,12 +66,32 @@ class OODBenchmark:
         alpha: float = 1.0,
         max_registers: int = 3,
         k: int = 2,
+        chaos: bool = False,
+        unit_limit: Optional[Dict[str, int]] = None,
+        latency_distribution: Optional[Dict[str, Tuple[int, int]]] = None,
         device: str = "cpu",
     ):
         self.alpha = alpha
         self.max_registers = max_registers
         self.k = k
+        self.chaos = chaos
         self.device = device
+
+        # Chaos defaults: single Mul port, variable latencies
+        if chaos and unit_limit is None:
+            unit_limit = {"Mul": 1}
+        if chaos and latency_distribution is None:
+            latency_distribution = {
+                "Mul": (2, 4),    # 2-4 cycles
+                "Add": (1, 2),    # 1-2 cycles
+                "Sub": (1, 2),    # 1-2 cycles
+                "Div": (3, 6),    # 3-6 cycles
+                "CmpGeZ": (1, 2), # 1-2 cycles
+                "Switch": (1, 1), # deterministic
+                "Merge": (1, 1),  # deterministic
+            }
+        self.unit_limit = unit_limit if unit_limit is not None else {}
+        self.latency_distribution = latency_distribution if latency_distribution is not None else {}
 
     def build_mlp_block(self, num_hidden=2, layer_width=4):
         """Thin wrapper around create_mlp_block for discoverability."""
@@ -92,6 +112,8 @@ class OODBenchmark:
             max_exec_units=self.k, latency=DEFAULT_LATENCY,
             max_registers=self.max_registers,
             register_penalty_alpha=self.alpha,
+            unit_limit=self.unit_limit,
+            latency_distribution=self.latency_distribution,
         )
         env.reset()
 
@@ -150,6 +172,7 @@ class OODBenchmark:
         peak = info.get("max_live_registers", 0)
         spill = info.get("spill_penalty", 0)
         spill_steps = info.get("spill_steps", 0)
+        struct_stalls = info.get("struct_stalls", 0)
 
         # CPF baseline
         cpf_sched = schedule_cpf(graph)
@@ -158,6 +181,8 @@ class OODBenchmark:
             max_exec_units=self.k, latency=DEFAULT_LATENCY,
             max_registers=self.max_registers,
             register_penalty_alpha=self.alpha,
+            unit_limit=self.unit_limit,
+            latency_distribution=self.latency_distribution,
         )
         cpf_env.reset()
         for nid in cpf_sched:
@@ -166,6 +191,7 @@ class OODBenchmark:
         cpf_peak = cpf_info.get("max_live_registers", 0)
         cpf_spill = cpf_info.get("spill_penalty", 0)
         cpf_spill_steps = cpf_info.get("spill_steps", 0)
+        cpf_struct_stalls = cpf_info.get("struct_stalls", 0)
 
         def pct(p, t):
             return 100 * p / max(t, 1)
@@ -181,6 +207,8 @@ class OODBenchmark:
             "cpf_spill": cpf_spill,
             "model_spill_steps": spill_steps,
             "cpf_spill_steps": cpf_spill_steps,
+            "struct_stalls": struct_stalls,
+            "cpf_struct_stalls": cpf_struct_stalls,
             "overall_max_cpd": pct(cpd_picks, total_steps),
             "high_max_cpd": pct(high_cpd, high_steps) if high_steps > 0 else None,
             "mid_max_cpd": pct(mid_cpd, mid_steps) if mid_steps > 0 else None,
@@ -237,9 +265,12 @@ class OODBenchmark:
                 inv = " * partial *"
 
             print(f"  {label} ({n_ops} ops):")
+            s = r.get('struct_stalls', 0)
+            cs = r.get('cpf_struct_stalls', 0)
+            stalls_str = f" | Stalls {s}(CPF={cs})" if s > 0 or cs > 0 else ""
             print(f"    Cycles {r['model_cycles']} (CPF {r['cpf_cycles']}, "
                   f"diff {r['cycle_diff']:+d}) | Peak {r['model_peak']} | "
-                  f"Spill {r['model_spill']:.2f} ({r['model_spill_steps']} steps)")
+                  f"Spill {r['model_spill']:.2f} ({r['model_spill_steps']} steps){stalls_str}")
             hi = f"{r['high_max_cpd']:.1f}%" if r['high_max_cpd'] is not None else "N/A"
             mi = f"{r['mid_max_cpd']:.1f}%" if r['mid_max_cpd'] is not None else "N/A"
             lo = f"{r['low_max_cpd']:.1f}%" if r['low_max_cpd'] is not None else "N/A"
@@ -256,10 +287,10 @@ class OODBenchmark:
         print("  OOD GENERALIZATION SUMMARY")
         print("=" * 95)
         hdr = (f"{'Graph':<34s} | {'Cyc':>4s} {'CPF':>4s} {'D':>4s} | "
-               f"{'Pk':>3s} {'Spill':>6s} | {'High%':>6s} {'Mid%':>6s} "
-               f"{'Low%':>6s} | {'Inv?':>5s}")
+               f"{'Pk':>3s} {'Spill':>6s} {'Stalls':>6s} | "
+               f"{'High%':>6s} {'Mid%':>6s} {'Low%':>6s} | {'Inv?':>5s}")
         print(hdr)
-        print("-" * 95)
+        print("-" * 105)
 
         for r in results:
             inv = ("YES!" if r["high_max_cpd"] is not None and r["high_max_cpd"] < 60
@@ -269,9 +300,11 @@ class OODBenchmark:
             mi = f"{r['mid_max_cpd']:.1f}" if r['mid_max_cpd'] is not None else "N/A"
             lo = f"{r['low_max_cpd']:.1f}" if r['low_max_cpd'] is not None else "N/A"
             short = r["label"][:33]
+            stalls = r.get('struct_stalls', 0)
             print(f"{short:<34s} | {r['model_cycles']:>4d} {r['cpf_cycles']:>4d} "
                   f"{r['cycle_diff']:+4d} | {r['model_peak']:>3d} "
-                  f"{r['model_spill']:>6.2f} | {hi:>6s} {mi:>6s} {lo:>6s} | {inv:>5s}")
+                  f"{r['model_spill']:>6.2f} {stalls:>6d} | "
+                  f"{hi:>6s} {mi:>6s} {lo:>6s} | {inv:>5s}")
 
         # Family-level convergence
         print()
