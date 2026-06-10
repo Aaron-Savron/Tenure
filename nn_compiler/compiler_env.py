@@ -590,14 +590,15 @@ class SchedulingGymEnv:
                                     if other != nid and other.startswith("fp_mul"):
                                         if other in self.node_consumers:
                                             self.node_consumers[other] += 1
-            self.outstanding: set = set()
-            self.max_outstanding: int = 0
-        else:
-            self.node_consumers = {}
-            self.outstanding = set()
-            self.max_outstanding = 0
+        self.outstanding: set = set()
+        self.max_outstanding: int = 0
+    else:
+        self.node_consumers = {}
+        self.outstanding = set()
+        self.max_outstanding = 0
+    self._sim_deadlock_warning = None
 
-        return self._ready_set()
+    return self._ready_set()
 
     def _ready_set(self) -> List[str]:
         """Return the set of nodes ready to fire (all deps satisfied)."""
