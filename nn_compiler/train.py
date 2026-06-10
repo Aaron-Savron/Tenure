@@ -27,6 +27,7 @@ from .policy import (
     decode_action,
     collect_switch_routings,
 )
+from typing import Dict
 from .checkpoint_surgery import transplant_weights
 from .scheduler_baseline import schedule_cpf
 
@@ -815,6 +816,481 @@ def frozen_adaptation_train(
         "best_reward": best_reward,
         "deadlock_count": deadlock_count,
         "n_cpf_beaten": n_cpf_beaten,
+        "final_checkpoint": final_path,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Phase 2: Unfrozen Escalation Training
+# ═══════════════════════════════════════════════════════════════
+
+LATENCY_MILESTONES = {
+    0: 3,
+    500: 6,
+    1200: 10,
+}
+
+def _get_latency(episode: int) -> int:
+    """Determine mem_latency for a given episode based on curriculum milestones."""
+    lat = 3
+    for ep_milestone, lat_val in sorted(LATENCY_MILESTONES.items()):
+        if episode >= ep_milestone:
+            lat = lat_val
+    return lat
+
+
+def _build_escalation_corpus():
+    """
+    Build a graded corpus of DL subgraphs for Phase 2 training.
+    Returns a list of (label, graph_fn, difficulty_rank) tuples.
+    Import is deferred to avoid circular imports.
+    """
+    from .dl_subgraphs import create_mlp_block, create_residual_add, create_layer_norm
+    return [
+        # Tier 1 — easiest (low register pressure, short tenure)
+        ("MLP (1L, W=3)",  lambda: create_mlp_block(1, 3), 1),
+        ("ResAdd (3L, d2)", lambda: create_residual_add(3, 2), 1),
+        # Tier 2 — moderate (deeper chains, more live regs)
+        ("MLP (3L, W=2)",  lambda: create_mlp_block(3, 2), 2),
+        ("ResAdd (4L, d2)", lambda: create_residual_add(4, 2), 2),
+        # Tier 3 — hardest (wide fan-in, long tenure)
+        ("ResAdd (5L, d1)", lambda: create_residual_add(5, 1), 3),
+        ("LayerNorm (6ch)", lambda: create_layer_norm(6), 3),
+        ("MLP (5L, W=2)",  lambda: create_mlp_block(5, 2), 3),
+    ]
+
+
+def unfrozen_escalation_train(
+    checkpoint_path: str = "checkpoints/phase1_final.pt",
+    num_episodes: int = 2000,
+    k: int = 2,
+    max_registers: int = 3,
+    register_penalty_alpha: float = 1.0,
+    learning_rate: float = 2e-5,
+    entropy_coef: float = 0.05,
+    clip_epsilon: float = 0.2,
+    ppo_epochs: int = 3,
+    log_every: int = 50,
+    save_every: int = 500,
+    checkpoint_dir: str = "checkpoints",
+    device: str = "cpu",
+) -> dict:
+    """
+    Phase 2: Unfrozen Escalation Training.
+
+    Loads the Phase 1 checkpoint (trained heads with frozen GAT body),
+    unfreezes the entire network, and escalates memory latency through
+    three curriculum milestones (3c -> 6c -> 10c) while cycling through
+    progressively wider DL subgraph topologies.
+
+    The GAT body refines its attention maps around the new memory
+    mechanics (spill/reload semantics) while the latency escalation
+    teaches the model the punishing reality of a true hardware
+    cache-miss penalty.
+
+    Curriculum milestones:
+        Ep 0-499:   mem_latency=3  (forgiving, Phase 1 conditions)
+        Ep 500-1199: mem_latency=6  (moderate cache penalty)
+        Ep 1200+:    mem_latency=10 (production-level cache miss)
+
+    Graphs are tiered by difficulty (1=easiest, 3=hardest). The active
+    pool starts with only Tier 1 graphs. When the policy achieves @CPF
+    mastery on a graph, it graduates and the next-tier graph is promoted.
+
+    Args:
+        checkpoint_path: Path to Phase 1 checkpoint (.pt with 'policy_state_dict').
+        num_episodes: Total training episodes.
+        k: Issue width for the scheduling simulator.
+        max_registers: Physical register limit (3 forces early spilling).
+        register_penalty_alpha: Penalty multiplier for register pressure excess.
+        learning_rate: Fine-tuning LR (low to prevent GAT forgetting).
+        entropy_coef: Entropy bonus coefficient.
+        clip_epsilon: PPO clip range.
+        ppo_epochs: Gradient steps per collected episode.
+        log_every: Metrics logging interval.
+        save_every: Checkpoint saving interval.
+        checkpoint_dir: Directory for checkpoints.
+        device: 'cpu' or 'cuda'.
+
+    Returns:
+        dict with keys:
+          - "rewards": per-episode reward list
+          - "spill_counts": per-episode spill count list
+          - "reload_counts": per-episode reload count list
+          - "best_reward": best reward seen
+          - "deadlock_count": total deadlock episodes
+          - "n_cpf_beaten": episodes where reward >= CPF baseline
+          - "graduated": list of (ep, label, tier, mastery) tuples
+          - "final_checkpoint": path to the saved final checkpoint
+          - "latency_schedule": list of (ep, latency) milestones reached
+    """
+    import os
+    import numpy as np
+    from itertools import cycle
+
+    print()
+    print("=" * 66)
+    print("  PHASE 2: UNFROZEN ESCALATION")
+    print("  Unfreeze GAT body, escalate latency, expand graph width")
+    print("=" * 66)
+
+    # ── Build graded corpus ──────────────────────────
+    corpus = _build_escalation_corpus()
+    print(f"  Corpus: {len(corpus)} graph types ({len([c for c in corpus if c[2]==1])} easy, "
+          f"{len([c for c in corpus if c[2]==2])} medium, "
+          f"{len([c for c in corpus if c[2]==3])} hard)")
+
+    # ── Load Phase 1 checkpoint ─────────────────────
+    print(f"  Loading Phase 1 checkpoint: {checkpoint_path}")
+    policy = SchedulingPolicy(node_feat_dim=15).to(device)
+    ckpt_data = torch.load(checkpoint_path, map_location=device)
+    ckpt_sd = ckpt_data["policy_state_dict"]
+    # Handle keys loaded on cpu that need to be moved to device
+    policy.load_state_dict(ckpt_sd)
+    print(f"  Policy params: {sum(p.numel() for p in policy.parameters())}")
+
+    # ── Unfreeze GAT body ───────────────────────────
+    unfreeze_gat_body(policy)
+
+    # ── Optimizer ───────────────────────────────────
+    # Low LR for fine-tuning — the GAT already knows how to schedule.
+    # We want to nudge its attention heads to recognize Is_Spilled and
+    # register pressure features, not overwrite its structural memory.
+    optimizer = torch.optim.Adam(policy.parameters(), lr=learning_rate)
+    total_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+    print(f"  Optimizer: Adam(lr={learning_rate}), {total_params:,} trainable params")
+    print()
+
+    # ── Progressive pool manager ────────────────────
+    # Active pool: graphs currently in training rotation.
+    # Waiting list: harder graphs that promote when easier ones graduate.
+    # Graduation: a graph graduates when @CPF mastery >= 0.8 over last 30 eps.
+    GRAD_THRESHOLD = 0.8
+    GRAD_WINDOW = 30
+    TIER_POOL_SIZE = {1: 2, 2: 2, 3: 3}  # how many slots per tier (matches corpus)
+
+    # Build pool structure
+    active_pool = {}  # item_index -> {label, g_fn, tier, cpf_hits: [], eps_on: int}
+    waiting_list = {1: [], 2: [], 3: []}  # tier -> list of (label, g_fn) awaiting promotion
+
+    for label, g_fn, tier in corpus:
+        waiting_list[tier].append((label, g_fn))
+
+    _next_pool_id = 0  # monotonically increasing ID to prevent key collisions
+
+    def _promote_from_tier(tier):
+        """Pop one graph from the waiting list for a given tier and add to active pool.
+        Uses a monotonically increasing ID to prevent key collisions when graphs graduate."""
+        nonlocal _next_pool_id
+        if waiting_list[tier]:
+            label, g_fn = waiting_list[tier].pop(0)
+            idx = _next_pool_id
+            _next_pool_id += 1
+            active_pool[idx] = {
+                "label": label,
+                "g_fn": g_fn,
+                "tier": tier,
+                "cpf_hits": [],
+                "eps_on": 0,
+            }
+            print(f"  [Pool] Promoted '{label}' (tier {tier}) to pool (id={idx})")
+            return idx
+        return None
+
+    # Initialize active pool — fill up to TIER_POOL_SIZE per tier
+    for tier in [1, 2, 3]:
+        for _ in range(TIER_POOL_SIZE[tier]):
+            _promote_from_tier(tier)
+
+    print(f"  Active pool: {len(active_pool)} graphs")
+    for idx, info in active_pool.items():
+        print(f"    {idx}: {info['label']} (tier {info['tier']})")
+    print(f"  Waiting list: {sum(len(v) for v in waiting_list.values())} graphs remaining")
+    print()
+
+    graduated = []  # (ep, label, tier, mastery_at_graduation)
+
+    # ── Training state ──────────────────────────────
+    baseline = RunningBaseline(alpha=0.9)
+    episode_rewards = []
+    episode_spills = []
+    episode_reloads = []
+    best_reward = -float("inf")
+    deadlock_count = 0
+    n_cpf_beaten = 0
+    latency_schedule = []  # (ep, latency) at milestone transitions
+
+    # Per-graph CPF cache (avoid recomputing every episode)
+    cpf_cache: Dict[str, tuple] = {}  # label -> (cpf_reward, cpf_cycles)
+
+    # Track which graph and CPF baseline was used each episode
+    episode_graphs = []
+    episode_cpf_rewards = []  # parallel to episode_rewards for accurate summary
+
+    try:
+        from tqdm import tqdm
+        progress = tqdm(range(num_episodes), desc="Unfrozen Escalation")
+    except ImportError:
+        progress = range(num_episodes)
+
+    for episode in progress:
+        # ── Determine current latency ────────────────
+        current_lat = _get_latency(episode)
+
+        # ── Performance-weighted graph sampling ──────
+        # Compute selection weights: low-mastery graphs are more likely.
+        if not active_pool:
+            print(f"Ep {episode}: active pool empty — all graphs graduated.")
+            break
+
+        weights = {}
+        for idx, info in active_pool.items():
+            recent = info["cpf_hits"][-GRAD_WINDOW:]
+            mastery = sum(recent) / len(recent) if recent else 0.0
+            # Invert: low mastery -> high weight (prefer underperforming graphs)
+            weights[idx] = max(0.05, 1.0 - mastery)
+
+        total_w = sum(weights.values())
+        probs = [weights[idx] / total_w for idx in active_pool]
+        rng = np.random.RandomState(episode * 117 + 42)
+        chosen_idx = rng.choice(list(active_pool.keys()), p=probs)
+
+        chosen = active_pool[chosen_idx]
+        chosen["eps_on"] += 1
+        graph = chosen["g_fn"]()
+        topo = graph.get_topological_order()
+        node_names = graph.inputs + topo + graph.outputs
+        episode_graphs.append(chosen["label"])
+
+        # ── CPF baseline ────────────────────────────
+        label = chosen["label"]
+        # Invalidate CPF cache at latency transitions so baseline is accurate
+        if episode in (0, 500, 1200):
+            cpf_cache.clear()
+
+        if label not in cpf_cache or current_lat != cpf_cache.get(label, (None, None))[2]:
+            cpf_sched = schedule_cpf(graph)
+            cpf_env = SchedulingGymEnv(
+                graph, None, [],
+                max_exec_units=k, latency=DEFAULT_LATENCY,
+                max_registers=max_registers,
+                register_penalty_alpha=register_penalty_alpha,
+                mem_latency=current_lat,
+            )
+            cpf_env.reset()
+            for nid in cpf_sched:
+                cpf_idx = node_names.index(nid)
+                _, _, cpf_done, cpf_info = cpf_env.step(cpf_idx)
+                if cpf_done:
+                    break
+            cpf_r = cpf_info.get("spill_penalty", 0) + cpf_info.get("cycles", 0)
+            cpf_cyc = cpf_info.get("cycles", 0)
+            cpf_cache[label] = (-cpf_r, cpf_cyc, current_lat)
+
+        cpf_reward, cpf_cycles, _ = cpf_cache[label]
+
+        # ── Training env with current latency ────────
+        env = SchedulingGymEnv(
+            graph, None, [],
+            max_exec_units=k, latency=DEFAULT_LATENCY,
+            max_registers=max_registers,
+            register_penalty_alpha=register_penalty_alpha,
+            mem_latency=current_lat,
+        )
+
+        reward, info = train_scheduling_episode_ppo_v2(
+            env, policy, optimizer, baseline,
+            entropy_coef=entropy_coef,
+            reward_scale=1.0,
+            clip_epsilon=clip_epsilon,
+            ppo_epochs=ppo_epochs,
+            device=device,
+        )
+
+        # Extract spill/reload counts
+        n_spills = sum(1 for e in env.schedule
+                       if isinstance(e, tuple) and e[0] == "spill")
+        n_reloads = sum(1 for e in env.schedule
+                        if isinstance(e, tuple) and e[0] == "reload")
+
+        episode_rewards.append(reward)
+        episode_spills.append(n_spills)
+        episode_reloads.append(n_reloads)
+
+        if reward > best_reward:
+            best_reward = reward
+        if reward <= -900:
+            deadlock_count += 1
+
+        # Track @CPF performance for this graph
+        episode_cpf_rewards.append(cpf_reward)
+        if reward >= cpf_reward:
+            n_cpf_beaten += 1
+            chosen["cpf_hits"].append(1)
+        else:
+            chosen["cpf_hits"].append(0)
+
+        # ── Graduation check ────────────────────────
+        recent_hits = chosen["cpf_hits"][-GRAD_WINDOW:]
+        if len(recent_hits) >= GRAD_WINDOW:
+            mastery = sum(recent_hits) / GRAD_WINDOW
+            if mastery >= GRAD_THRESHOLD and chosen["eps_on"] >= GRAD_WINDOW:
+                # Graduate this graph
+                graduated.append((episode, chosen["label"], chosen["tier"], mastery))
+                del active_pool[chosen_idx]
+                print(
+                    f"  Ep {episode:4d}: GRADUATED '{chosen['label']}' "
+                    f"(tier {chosen['tier']}, mastery={mastery:.0%})"
+                )
+                # Promote new graph from same tier or next tier
+                promoted = _promote_from_tier(chosen["tier"])
+                if promoted is not None:
+                    pass
+                # Clear stale CPF cache entry so it's recomputed next time
+                if chosen["label"] in cpf_cache:
+                    del cpf_cache[chosen["label"]]
+
+        # ── Latency milestone logging ────────────────
+        if episode == 0 or (
+            episode in LATENCY_MILESTONES and current_lat != _get_latency(episode - 1)
+        ):
+            latency_schedule.append((episode, current_lat))
+            print(f"  Ep {episode:4d}: Latency step-up -> mem_latency={current_lat}")
+
+        # ── Logging ──────────────────────────────────
+        if (episode + 1) % log_every == 0 or episode < 5:
+            recent_r = episode_rewards[-min(log_every, len(episode_rewards)):]
+            avg_r = sum(recent_r) / len(recent_r)
+            avg_s = (sum(episode_spills[-min(log_every, len(episode_spills)):])
+                     / min(log_every, len(episode_spills)))
+            pool_mastery = {
+                info["label"]: (
+                    sum(info["cpf_hits"][-GRAD_WINDOW:]) / len(info["cpf_hits"][-GRAD_WINDOW:])
+                    if len(info["cpf_hits"]) >= GRAD_WINDOW else 0.0
+                )
+                for info in active_pool.values()
+            }
+
+            if isinstance(progress, range):
+                print(
+                    f"  Ep {episode + 1:4d}/{num_episodes} | "
+                    f"reward={avg_r:7.1f} | "
+                    f"lat={current_lat:2d} | "
+                    f"spills={avg_s:.1f}/ep | "
+                    f"pool={len(active_pool)}g | "
+                    f"grad={len(graduated)} | "
+                    f"dead={deadlock_count:3d} | "
+                    f"{chosen['label']}"
+                )
+                if pool_mastery and (episode + 1) % (log_every * 2) == 0:
+                    mastery_str = " | ".join(
+                        f"{k}={v:.0%}" for k, v in sorted(pool_mastery.items())
+                    )
+                    print(f"         mastery: {mastery_str}")
+            else:
+                progress.set_postfix({
+                    "avg": f"{avg_r:.1f}",
+                    "lat": current_lat,
+                    "pool": len(active_pool),
+                    "grad": len(graduated),
+                    "dead": deadlock_count,
+                })
+
+        # ── Save checkpoint ──────────────────────────
+        if (episode + 1) % save_every == 0:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            ckpt_path = os.path.join(
+                checkpoint_dir,
+                f"phase2_ep{episode + 1}.pt",
+            )
+            torch.save({
+                "policy_state_dict": policy.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "phase": 2,
+                "episode": episode + 1,
+                "rewards": episode_rewards,
+                "spill_counts": episode_spills,
+                "reload_counts": episode_reloads,
+                "best_reward": best_reward,
+                "graduated": graduated,
+                "latency_schedule": latency_schedule,
+                "config": {
+                    "k": k,
+                    "max_registers": max_registers,
+                    "register_penalty_alpha": register_penalty_alpha,
+                    "learning_rate": learning_rate,
+                    "entropy_coef": entropy_coef,
+                    "clip_epsilon": clip_epsilon,
+                    "ppo_epochs": ppo_epochs,
+                },
+            }, ckpt_path)
+            print(f"  [Checkpoint] {ckpt_path}")
+
+    # ── Final summary ────────────────────────────────
+    last_200 = episode_rewards[-200:] if len(episode_rewards) >= 200 else episode_rewards
+    avg_last = sum(last_200) / len(last_200)
+    total_spills = sum(episode_spills)
+    total_reloads = sum(episode_reloads)
+
+    # Track CPF-beaten rate per latency regime (uses cached episode_cpf_rewards)
+    regime_0_499 = episode_cpf_rewards[:500]
+    regime_500_1199 = episode_cpf_rewards[500:1200]
+    regime_1200_plus = episode_cpf_rewards[1200:]
+
+    def _regime_cpf_rate(segment, rewards_seg):
+        """CPF-beaten rate using parallel reward and CPF lists."""
+        if not segment or not rewards_seg:
+            return 0.0
+        n = min(len(segment), len(rewards_seg))
+        hits = sum(1 for i in range(n) if rewards_seg[i] >= segment[i])
+        return hits / n
+
+    print()
+    print(f"  PHASE 2 COMPLETE")
+    print(f"  {'=' * 40}")
+    print(f"  Best reward:     {best_reward:7.1f}")
+    print(f"  Avg last 200:    {avg_last:7.1f}")
+    print(f"  Deadlocks:       {deadlock_count:4d}/{num_episodes}")
+    print(f"  @CPF beaten:     {n_cpf_beaten:4d}/{num_episodes}")
+    print(f"  Graphs graduated:{len(graduated):4d}")
+    print(f"  Total spills:    {total_spills:4d}")
+    print(f"  Total reloads:   {total_reloads:4d}")
+    print(f"  Latency schedule:"
+          f"  mem_lat=3: {_regime_cpf_rate(regime_0_499, episode_rewards[:500])*100:.0f}% @CPF, "
+          f"mem_lat=6: {_regime_cpf_rate(regime_500_1199, episode_rewards[500:1200])*100:.0f}% @CPF, "
+          f"mem_lat=10: {_regime_cpf_rate(regime_1200_plus, episode_rewards[1200:])*100:.0f}% @CPF")
+    print()
+
+    if graduated:
+        print(f"  Graduated graphs:")
+        for ep, lbl, tier, mas in graduated:
+            print(f"    Ep {ep:4d}: {lbl:20s} (tier {tier}, mastery={mas:.0%})")
+
+    # ── Save final model ─────────────────────────────
+    final_path = os.path.join(checkpoint_dir, "phase2_final.pt")
+    torch.save({
+        "policy_state_dict": policy.state_dict(),
+        "phase": 2,
+        "episode": num_episodes,
+        "rewards": episode_rewards,
+        "spill_counts": episode_spills,
+        "reload_counts": episode_reloads,
+        "best_reward": best_reward,
+        "graduated": graduated,
+        "latency_schedule": latency_schedule,
+        "config": {},
+    }, final_path)
+    print(f"  Final checkpoint: {final_path}")
+
+    return {
+        "rewards": episode_rewards,
+        "spill_counts": episode_spills,
+        "reload_counts": episode_reloads,
+        "best_reward": best_reward,
+        "deadlock_count": deadlock_count,
+        "n_cpf_beaten": n_cpf_beaten,
+        "graduated": graduated,
+        "latency_schedule": latency_schedule,
         "final_checkpoint": final_path,
     }
 
