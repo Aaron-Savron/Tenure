@@ -535,6 +535,8 @@ class SchedulingGymEnv:
         self.unit_limit = unit_limit if unit_limit is not None else {}
         self.latency_distribution = latency_distribution if latency_distribution is not None else {}
         self.mem_latency = mem_latency
+        # Cache node_names ordering (inputs + topo + outputs) for action index mapping
+        self.__node_names = self.graph.inputs + self.topo_order + self.graph.outputs
         self.reset()
 
     def reset(self):
@@ -643,16 +645,21 @@ class SchedulingGymEnv:
             done: True if all nodes scheduled AND no spills/reloads pending.
             info: Dict with metrics (only populated when done).
         """
-        n = len(self.topo_order)
+        node_names = self.__node_names
+        total_nodes = len(node_names)
 
-        if action_idx >= n:
+        if action_idx >= total_nodes:
             # ── Spill action (N..2N-1) ─────────────────────────
-            sp_idx = action_idx - n
-            if sp_idx >= n:
+            sp_idx = action_idx - total_nodes
+            if sp_idx >= total_nodes:
                 return self._ready_set(), -1000.0, True, {
-                    "error": f"Spill action {action_idx} out of range [N, 2N)."
+                    "error": f"Spill action {action_idx} out of range."
                 }
-            node_id = self.topo_order[sp_idx]
+            node_id = node_names[sp_idx]
+            if node_id not in self.topo_order:
+                return self._ready_set(), -1000.0, True, {
+                    "error": f"Cannot spill '{node_id}': not an op node."
+                }
             if node_id not in self.outstanding or node_id in self.spilled_nodes:
                 return self._ready_set(), -1000.0, True, {
                     "error": f"Cannot spill '{node_id}': output not live in register."
@@ -662,9 +669,13 @@ class SchedulingGymEnv:
             self.spilled_nodes.add(node_id)
             self.stack_pool[node_id] = len(self.schedule)
 
-        elif self.topo_order[action_idx] in self.spilled_nodes:
+        elif node_names[action_idx] in self.spilled_nodes:
             # ── Reload action (0..N-1, node is spilled) ────────
-            node_id = self.topo_order[action_idx]
+            node_id = node_names[action_idx]
+            if node_id not in self.topo_order:
+                return self._ready_set(), -1000.0, True, {
+                    "error": f"Cannot reload '{node_id}': not an op node."
+                }
             if node_id in self.reload_in_progress:
                 return self._ready_set(), -1000.0, True, {
                     "error": f"Node '{node_id}' is already being reloaded."
@@ -676,7 +687,11 @@ class SchedulingGymEnv:
 
         else:
             # ── Issue action (0..N-1, node is unissued+ready) ──
-            node_id = self.topo_order[action_idx]
+            node_id = node_names[action_idx]
+            if node_id not in self.topo_order:
+                return self._ready_set(), -1000.0, True, {
+                    "error": f"Cannot issue '{node_id}': not an op node."
+                }
             if node_id in self.executed or node_id not in self._ready_set():
                 return self._ready_set(), -1000.0, True, {
                     "error": f"Node '{node_id}' is not ready for issue."

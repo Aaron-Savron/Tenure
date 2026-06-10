@@ -337,10 +337,14 @@ def encode_scheduling_obs(env):
         if name in name_to_idx:
             n_ready_mask[name_to_idx[name]] = True
 
-    # ── Action mask: 2N-length for flat Issue/Reload + Spill space ──
-    N = len(env.topo_order)
-    action_mask = torch.zeros(2 * N, dtype=torch.bool)
+    # ── Action mask: 2*num_nodes-length for flat Issue/Reload + Spill space ──
+    # Must cover ALL nodes (including Input/Output) to match the flattened
+    # scores tensor [num_nodes, 2] -> [2 * num_nodes], but only op nodes
+    # (in topo_order) can be valid actions.
+    num_total = len(node_names)
+    action_mask = torch.zeros(2 * num_total, dtype=torch.bool)
     for i, nid in enumerate(env.topo_order):
+        nidx = name_to_idx[nid]  # position in node_names
         # Issue: unissued + ready + not spilled
         unissued_ready = (nid not in env.executed and
                           nid in ready_set and
@@ -348,18 +352,18 @@ def encode_scheduling_obs(env):
         # Reload: spilled + not already reloading
         can_reload = (nid in env.spilled_nodes and
                       nid not in env.reload_in_progress)
-        action_mask[i] = unissued_ready or can_reload
+        action_mask[nidx] = unissued_ready or can_reload
 
         # Spill: output is live in a register (outstanding + not spilled)
         can_spill = (nid in env.outstanding and
                      nid not in env.spilled_nodes)
-        action_mask[N + i] = can_spill
+        action_mask[num_total + nidx] = can_spill
 
     return {
         "x": x,
         "edge_index": edge_index,
-        "ready_mask": action_mask,  # 2N-length for policy
-        "n_ready_mask": n_ready_mask,  # N-length for CPD tracking
+        "ready_mask": action_mask,  # 2*num_nodes-length for policy
+        "n_ready_mask": n_ready_mask,  # node_names-length for CPD tracking
         "node_names": node_names,
         "action_mask": action_mask,
     }
