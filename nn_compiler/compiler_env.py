@@ -688,6 +688,8 @@ class SchedulingGymEnv:
                 info["cycles_source"] = "simulated"
                 info["spill_penalty"] = spill_penalty
                 info["struct_stalls"] = self._sim_struct_stalls
+                if self._sim_deadlock_warning:
+                    info["deadlock_warning"] = self._sim_deadlock_warning
                 if self.max_registers is not None:
                     info["max_live_registers"] = self._sim_max_live
                     info["registers"] = self.max_registers
@@ -708,6 +710,8 @@ class SchedulingGymEnv:
                 info = {"cycles": sim_cycles, "max_queue": 0, "cycles_source": "simulated"}
                 info["spill_penalty"] = spill_penalty
                 info["struct_stalls"] = self._sim_struct_stalls
+                if self._sim_deadlock_warning:
+                    info["deadlock_warning"] = self._sim_deadlock_warning
                 if self.max_registers is not None:
                     info["max_live_registers"] = self._sim_max_live
                     info["registers"] = self.max_registers
@@ -932,10 +936,13 @@ class SchedulingGymEnv:
         if len(completion) < n:
             stranded = [nid for nid in schedule if nid not in completion]
             stranded_types = [f"{n}({graph.nodes[n].type})" for n in stranded]
-            print(f"  [SIMULATOR] WARNING: Register deadlock at cycle {cycle}/{MAX_CYCLES}! "
-                  f"{n - len(completion)}/{n} ops stranded: {stranded_types}")
-            print(f"  [SIMULATOR]   live_regs={len(live_regs)}, max_live={max_live}, "
-                  f"struct_stalls={struct_stalls}")
+            self._sim_deadlock_warning = (
+                f"MAX_CYCLES reached: {n - len(completion)}/{n} ops stranded "
+                f"{stranded_types}, live_regs={len(live_regs)}, "
+                f"struct_stalls={struct_stalls}"
+            )
+        else:
+            self._sim_deadlock_warning = None
 
         self._sim_max_live = max_live
         self._sim_live_regs_history = live_regs_history
