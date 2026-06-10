@@ -1142,6 +1142,11 @@ def unfrozen_escalation_train(
     # Per-graph CPF cache (avoid recomputing every episode)
     cpf_cache: Dict[str, tuple] = {}  # label -> (cpf_reward, cpf_cycles)
 
+    # ── Baseline snapshots ──────────────────────────
+    # Per-episode snapshot of each topology's RunningBaseline value.
+    # Logged every log_every episodes to track individual graph reward curves.
+    baseline_snapshots: list = []  # [{ep: N, m_lat: N, baselines: {label: val}}]
+
     # Track which graph and CPF baseline was used each episode
     episode_graphs = []
     episode_cpf_rewards = []  # parallel to episode_rewards for accurate summary
@@ -1318,6 +1323,18 @@ def unfrozen_escalation_train(
                 for info in active_pool.values()
             }
 
+            # ── Baseline snapshot (every log_every) ──
+            if (episode + 1) % log_every == 0 and baselines:
+                snapshot = {
+                    "ep": episode + 1,
+                    "mem_lat": current_lat,
+                    "layers": list(current_layers),
+                    "baselines": {
+                        lbl: bl.get() for lbl, bl in sorted(baselines.items())
+                    },
+                }
+                baseline_snapshots.append(snapshot)
+
             if isinstance(progress, range):
                 print(
                     f"  Ep {episode + 1:4d}/{num_episodes} | "
@@ -1336,6 +1353,14 @@ def unfrozen_escalation_train(
                         f"{k}={v:.0%}" for k, v in sorted(pool_mastery.items())
                     )
                     print(f"         mastery: {mastery_str}")
+                    # Show per-topology baseline values alongside mastery
+                    bl_str = " | ".join(
+                        f"bl:{k}={baselines[k].get():.0f}"
+                        for k in sorted(pool_mastery.keys())
+                        if k in baselines
+                    )
+                    if bl_str:
+                        print(f"         {bl_str}")
             else:
                 progress.set_postfix({
                     "avg": f"{avg_r:.1f}",
@@ -1364,6 +1389,7 @@ def unfrozen_escalation_train(
                 "reload_counts": episode_reloads,
                 "best_reward": best_reward,
                 "graduated": graduated,
+                "baseline_snapshots": baseline_snapshots,
                 "latency_schedule": latency_schedule,
                 "config": {
                     "k": k,
@@ -1428,6 +1454,7 @@ def unfrozen_escalation_train(
         "reload_counts": episode_reloads,
         "best_reward": best_reward,
         "graduated": graduated,
+        "baseline_snapshots": baseline_snapshots,
         "latency_schedule": latency_schedule,
         "config": {},
     }, final_path)
@@ -1441,6 +1468,7 @@ def unfrozen_escalation_train(
         "deadlock_count": deadlock_count,
         "n_cpf_beaten": n_cpf_beaten,
         "graduated": graduated,
+        "baseline_snapshots": baseline_snapshots,
         "latency_schedule": latency_schedule,
         "final_checkpoint": final_path,
     }
