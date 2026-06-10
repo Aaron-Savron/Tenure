@@ -875,77 +875,74 @@ def frozen_adaptation_train(
 #  Phase 2: Unfrozen Escalation Training
 # ═══════════════════════════════════════════════════════════════
 
+# ── Latency escalation: start higher (5c) for sharper gradients, step to 10c ──
 LATENCY_MILESTONES = {
-    0: 3,
-    500: 6,
-    1200: 10,
-}
-
-# Progressive unfreezing schedule: maps episode -> list of GAT layer indices to thaw.
-# Layer 3 is closest to the priority head; layer 0 is closest to the input.
-# Thawing top-down prevents cascading feature drift in early layers.
-UNFREEZE_SCHEDULE = {
-    0: [3],            # Phase 2a: last layer only (bridge to new action space)
-    500: [2, 3],       # Phase 2b: last 2 layers (deeper semantic adjustment)
-    1000: [1, 2, 3],   # Phase 2c: last 3 layers
-    1500: [0, 1, 2, 3],# Phase 2d: full unfreeze (global alignment)
+    0: 5,
+    500: 8,
+    1000: 10,
 }
 
 def _get_latency(episode: int) -> int:
     """Determine mem_latency for a given episode based on curriculum milestones."""
-    lat = 3
+    lat = LATENCY_MILESTONES[0]
     for ep_milestone, lat_val in sorted(LATENCY_MILESTONES.items()):
         if episode >= ep_milestone:
             lat = lat_val
     return lat
 
 
-def _get_unfreeze_layers(episode: int) -> list:
-    """Determine which GAT layers should be trainable at a given episode."""
-    layers = [3]  # default: last layer only
-    for ep_milestone, thaw_layers in sorted(UNFREEZE_SCHEDULE.items()):
-        if episode >= ep_milestone:
-            layers = thaw_layers
-    return layers
-
-
-def set_gat_layer_trainable(policy, target_layers: list):
+def configure_stratified_optimizer(policy, base_lr: float = 2e-5):
     """
-    Selectively unfreeze specific GAT layers while locking down the rest.
+    Construct an Adam optimizer with geometrically decaying learning rates
+    from the output priority heads down to the foundational input layer.
 
-    Args:
-        policy: SchedulingPolicy instance.
-        target_layers: List of layer indices to make trainable (e.g., [3] for last layer).
-                       Layer 0 is closest to input, layer 3 is closest to the head.
+    All 598,786 parameters are trainable from episode 1. Each GAT layer
+    learns at a fraction of the base LR, with Layer 0 (closest to input)
+    at 0.05x and Layer 3 (closest to head) at 0.5x. The priority head
+    and input projection get the full 1.0x base LR.
 
-    Keeps input_proj and priority_head trainable regardless.
-    Returns list of trainable parameter names for logging.
+    This replaces the hard freeze/thaw progressive unfreeze with a smooth
+    velocity gradient across the network depth, preventing gradient cliffs
+    while allowing every layer to absorb spill-aware representations.
+
+    LR multiplier schedule:
+        Heads (input_proj + priority_head): 1.0x -> {base_lr:.0e}
+        Layer 3 (closest to head):          0.5x -> {base_lr*0.5:.0e}
+        Layer 2:                            0.25x -> {base_lr*0.25:.0e}
+        Layer 1:                            0.1x -> {base_lr*0.1:.0e}
+        Layer 0 (closest to input):         0.05x -> {base_lr*0.05:.0e}
     """
-    # First freeze ALL GAT params
-    frozen_count = 0
-    for name, param in policy.named_parameters():
-        if name.startswith("gat_convs.") or name.startswith("gat_lin."):
-            param.requires_grad = False
-            frozen_count += 1
+    # Ensure all parameters are trainable
+    for param in policy.parameters():
+        param.requires_grad = True
 
-    # Thaw designated layers
-    thawed = []
-    for layer_idx in target_layers:
-        for name, param in policy.named_parameters():
-            if name.startswith(f"gat_convs.{layer_idx}.") or \
-               name.startswith(f"gat_lin.{layer_idx}."):
-                param.requires_grad = True
-                thawed.append(name)
+    param_groups = []
 
-    # input_proj and priority_head always trainable
-    for name, param in policy.named_parameters():
-        if not name.startswith("gat_"):
-            param.requires_grad = True
+    # Group 1: Heads (input_proj + priority_head) — full velocity
+    head_params = list(policy.input_proj.parameters()) + list(policy.priority_head.parameters())
+    param_groups.append({"params": head_params, "lr": base_lr * 1.0})
 
-    n_trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    layer_str = ", ".join(str(l) for l in sorted(target_layers))
-    print(f"  GAT layers thawed: [{layer_str}] — {n_trainable:,} trainable params")
-    return thawed
+    # Groups 2-5: GAT layers with geometrically decaying LR
+    # Both gat_convs (GATConv) and gat_lin (Linear) per layer
+    lr_scales = {3: 0.5, 2: 0.25, 1: 0.1, 0: 0.05}
+    for layer_idx in [3, 2, 1, 0]:
+        layer_params = []
+        layer_params.extend(list(policy.gat_convs[layer_idx].parameters()))
+        layer_params.extend(list(policy.gat_lin[layer_idx].parameters()))
+        param_groups.append({
+            "params": layer_params,
+            "lr": base_lr * lr_scales[layer_idx],
+        })
+
+    optimizer = torch.optim.Adam(param_groups)
+
+    n_total = sum(p.numel() for p in policy.parameters())
+    print(f"  Stratified optimizer: {len(param_groups)} param groups")
+    for i, pg in enumerate(param_groups):
+        n_p = sum(p.numel() for p in pg["params"])
+        print(f"    Group {i}: {n_p:>7,} params @ lr={pg['lr']:.0e}")
+    print(f"  Total: {n_total:,} params (all trainable)")
+    return optimizer
 
 
 def _build_escalation_corpus():
@@ -985,26 +982,34 @@ def unfrozen_escalation_train(
     device: str = "cpu",
 ) -> dict:
     """
-    Phase 2: Unfrozen Escalation Training.
+    Phase 2: Unfrozen Escalation with Stratified Learning Rates.
 
-    Loads the Phase 1 checkpoint (trained heads with frozen GAT body),
-    unfreezes the entire network, and escalates memory latency through
-    three curriculum milestones (3c -> 6c -> 10c) while cycling through
-    progressively wider DL subgraph topologies.
+    Loads the Phase 1 checkpoint and trains all 598K parameters with
+    geometrically decaying learning rates across GAT layers. The base LR
+    (2e-5) applies to the priority head and input projection. Each GAT
+    layer below learns at a fraction: Layer 3 at 0.5x, Layer 2 at 0.25x,
+    Layer 1 at 0.1x, Layer 0 at 0.05x.
 
-    The GAT body refines its attention maps around the new memory
-    mechanics (spill/reload semantics) while the latency escalation
-    teaches the model the punishing reality of a true hardware
-    cache-miss penalty.
+    Memory latency escalates through three milestones (5c -> 8c -> 10c)
+    to create progressively stronger gradient contrast around spill/reload
+    decisions. The progressive pool manager rotates graph types by
+    @CPF mastery, graduating graphs that consistently beat the CPF
+    heuristic.
+
+    This replaces the binary freeze/thaw progressive unfreeze with a
+    smooth velocity gradient across the network depth.
 
     Curriculum milestones:
-        Ep 0-499:   mem_latency=3  (forgiving, Phase 1 conditions)
-        Ep 500-1199: mem_latency=6  (moderate cache penalty)
-        Ep 1200+:    mem_latency=10 (production-level cache miss)
+        Ep 0-499:   mem_latency=5  (moderate penalty, crisp gradients)
+        Ep 500-999:  mem_latency=8  (high pressure)
+        Ep 1000+:    mem_latency=10 (production-level cache miss)
 
-    Graphs are tiered by difficulty (1=easiest, 3=hardest). The active
-    pool starts with only Tier 1 graphs. When the policy achieves @CPF
-    mastery on a graph, it graduates and the next-tier graph is promoted.
+    LR multiplier schedule:
+        Heads:      1.0x base_lr (full velocity for action syntax)
+        Layer 3:    0.5x base_lr
+        Layer 2:    0.25x base_lr
+        Layer 1:    0.1x base_lr
+        Layer 0:    0.05x base_lr (gentle foundation morphing)
 
     Args:
         checkpoint_path: Path to Phase 1 checkpoint (.pt with 'policy_state_dict').
@@ -1012,7 +1017,7 @@ def unfrozen_escalation_train(
         k: Issue width for the scheduling simulator.
         max_registers: Physical register limit (3 forces early spilling).
         register_penalty_alpha: Penalty multiplier for register pressure excess.
-        learning_rate: Fine-tuning LR (low to prevent GAT forgetting).
+        learning_rate: Base LR for the priority head (other layers scaled down).
         entropy_coef: Entropy bonus coefficient.
         clip_epsilon: PPO clip range.
         ppo_epochs: Gradient steps per collected episode.
@@ -1039,8 +1044,8 @@ def unfrozen_escalation_train(
 
     print()
     print("=" * 66)
-    print("  PHASE 2: UNFROZEN ESCALATION")
-    print("  Unfreeze GAT body, escalate latency, expand graph width")
+    print("  PHASE 2: STRATIFIED LR ESCALATION")
+    print("  All layers trainable, geometrically decaying LRs, 5c->8c->10c")
     print("=" * 66)
 
     # ── Build graded corpus ──────────────────────────
@@ -1054,20 +1059,11 @@ def unfrozen_escalation_train(
     policy = SchedulingPolicy(node_feat_dim=15).to(device)
     ckpt_data = torch.load(checkpoint_path, map_location=device)
     ckpt_sd = ckpt_data["policy_state_dict"]
-    # Handle keys loaded on cpu that need to be moved to device
     policy.load_state_dict(ckpt_sd)
     print(f"  Policy params: {sum(p.numel() for p in policy.parameters())}")
 
-    # ── Unfreeze GAT body ───────────────────────────
-    unfreeze_gat_body(policy)
-
-    # ── Optimizer ───────────────────────────────────
-    # Low LR for fine-tuning — the GAT already knows how to schedule.
-    # We want to nudge its attention heads to recognize Is_Spilled and
-    # register pressure features, not overwrite its structural memory.
-    optimizer = torch.optim.Adam(policy.parameters(), lr=learning_rate)
-    total_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    print(f"  Optimizer: Adam(lr={learning_rate}), {total_params:,} trainable params")
+    # ── Stratified optimizer (replaces freeze/thaw infrastructure) ──
+    optimizer = configure_stratified_optimizer(policy, base_lr=learning_rate)
     print(f"  entropy={entropy_coef}, clip={clip_epsilon}, PPO epochs={ppo_epochs}")
     print()
 
@@ -1142,10 +1138,9 @@ def unfrozen_escalation_train(
     # Per-graph CPF cache (avoid recomputing every episode)
     cpf_cache: Dict[str, tuple] = {}  # label -> (cpf_reward, cpf_cycles)
 
-    # ── Baseline snapshots ──────────────────────────
     # Per-episode snapshot of each topology's RunningBaseline value.
     # Logged every log_every episodes to track individual graph reward curves.
-    baseline_snapshots: list = []  # [{ep: N, m_lat: N, baselines: {label: val}}]
+    baseline_snapshots: list = []
 
     # Track which graph and CPF baseline was used each episode
     episode_graphs = []
@@ -1156,10 +1151,6 @@ def unfrozen_escalation_train(
         progress = tqdm(range(num_episodes), desc="Unfrozen Escalation")
     except ImportError:
         progress = range(num_episodes)
-
-    # ── Initialize progressive unfreeze ───────────
-    current_layers = _get_unfreeze_layers(0)
-    set_gat_layer_trainable(policy, current_layers)
 
     for episode in progress:
         # ── Determine current latency ────────────────
@@ -1193,7 +1184,7 @@ def unfrozen_escalation_train(
         # ── CPF baseline ────────────────────────────
         label = chosen["label"]
         # Invalidate CPF cache at latency transitions so baseline is accurate
-        if episode in (0, 500, 1200):
+        if episode in (0, 500, 1000):
             cpf_cache.clear()
 
         if label not in cpf_cache or current_lat != cpf_cache.get(label, (None, None))[2]:
@@ -1291,21 +1282,12 @@ def unfrozen_escalation_train(
                 if chosen["label"] in cpf_cache:
                     del cpf_cache[chosen["label"]]
 
-        # ── Latency milestone & unfreeze logging ──────
+        # ── Latency milestone logging ────────────────
         if episode == 0 or (
             episode in LATENCY_MILESTONES and current_lat != _get_latency(episode - 1)
         ):
             latency_schedule.append((episode, current_lat))
             print(f"  Ep {episode:4d}: Latency step-up -> mem_latency={current_lat}")
-
-        # ── Progressive unfreeze check ───────────────
-        new_layers = _get_unfreeze_layers(episode)
-        if new_layers != current_layers:
-            set_gat_layer_trainable(policy, new_layers)
-            current_layers = new_layers
-            # Recreate optimizer with new param set
-            optimizer = torch.optim.Adam(policy.parameters(), lr=learning_rate)
-            print(f"  Ep {episode:4d}: Unfreeze step-up -> layers {current_layers}")
 
         # ── Logging ──────────────────────────────────
         if (episode + 1) % log_every == 0 or episode < 5:
@@ -1327,8 +1309,7 @@ def unfrozen_escalation_train(
             if (episode + 1) % log_every == 0 and baselines:
                 snapshot = {
                     "ep": episode + 1,
-                    "mem_lat": current_lat,
-                    "layers": list(current_layers),
+                    "mem_lat": current_lat,                        "layers": "all",
                     "baselines": {
                         lbl: bl.get() for lbl, bl in sorted(baselines.items())
                     },
@@ -1340,7 +1321,6 @@ def unfrozen_escalation_train(
                     f"  Ep {episode + 1:4d}/{num_episodes} | "
                     f"reward={avg_r:7.1f} | "
                     f"lat={current_lat:2d} | "
-                    f"L{min(current_layers)}-{max(current_layers)} | "
                     f"kl={avg_kl:.4f} | "
                     f"spills={avg_s:.1f}/ep | "
                     f"pool={len(active_pool)}g | "
@@ -1365,7 +1345,6 @@ def unfrozen_escalation_train(
                 progress.set_postfix({
                     "avg": f"{avg_r:.1f}",
                     "lat": current_lat,
-                    "layers": f"{min(current_layers)}-{max(current_layers)}",
                     "kl": f"{avg_kl:.4f}",
                     "pool": len(active_pool),
                     "grad": len(graduated),
@@ -1409,10 +1388,10 @@ def unfrozen_escalation_train(
     total_spills = sum(episode_spills)
     total_reloads = sum(episode_reloads)
 
-    # Track CPF-beaten rate per latency regime (uses cached episode_cpf_rewards)
+    # Track CPF-beaten rate per latency regime (matches new milestones: 5c→8c→10c)
     regime_0_499 = episode_cpf_rewards[:500]
-    regime_500_1199 = episode_cpf_rewards[500:1200]
-    regime_1200_plus = episode_cpf_rewards[1200:]
+    regime_500_999 = episode_cpf_rewards[500:1000]
+    regime_1000_plus = episode_cpf_rewards[1000:]
 
     def _regime_cpf_rate(segment, rewards_seg):
         """CPF-beaten rate using parallel reward and CPF lists."""
@@ -1433,9 +1412,9 @@ def unfrozen_escalation_train(
     print(f"  Total spills:    {total_spills:4d}")
     print(f"  Total reloads:   {total_reloads:4d}")
     print(f"  Latency schedule:"
-          f"  mem_lat=3: {_regime_cpf_rate(regime_0_499, episode_rewards[:500])*100:.0f}% @CPF, "
-          f"mem_lat=6: {_regime_cpf_rate(regime_500_1199, episode_rewards[500:1200])*100:.0f}% @CPF, "
-          f"mem_lat=10: {_regime_cpf_rate(regime_1200_plus, episode_rewards[1200:])*100:.0f}% @CPF")
+          f"  mem_lat=5: {_regime_cpf_rate(regime_0_499, episode_rewards[:500])*100:.0f}% @CPF, "
+          f"mem_lat=8: {_regime_cpf_rate(regime_500_999, episode_rewards[500:1000])*100:.0f}% @CPF, "
+          f"mem_lat=10: {_regime_cpf_rate(regime_1000_plus, episode_rewards[1000:])*100:.0f}% @CPF")
     print()
 
     if graduated:
