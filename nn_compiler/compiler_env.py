@@ -522,6 +522,7 @@ class SchedulingGymEnv:
         register_penalty_alpha: float = 0.0,
         unit_limit: Optional[Dict[str, int]] = None,
         latency_distribution: Optional[Dict[str, Tuple[int, int]]] = None,
+        mem_latency: int = 10,
     ):
         self.graph = graph
         self.vm_bridge = vm_bridge
@@ -533,12 +534,16 @@ class SchedulingGymEnv:
         self.register_penalty_alpha = register_penalty_alpha
         self.unit_limit = unit_limit if unit_limit is not None else {}
         self.latency_distribution = latency_distribution if latency_distribution is not None else {}
+        self.mem_latency = mem_latency
         self.reset()
 
     def reset(self):
         """Reset the environment."""
         self.executed: set = set()
-        self.schedule: List[str] = []
+        self.schedule: List[Tuple[str, str]] = []  # (action_type, node_id)
+        self.stack_pool: Dict[str, int] = {}  # node_id -> spill_cycle
+        self.spilled_nodes: set = set()
+        self.reload_in_progress: set = set()
         # Track remaining dependency count for each op node.
         # Only count dependencies on other op nodes (not Input nodes),
         # since Input nodes are always available.
@@ -590,82 +595,126 @@ class SchedulingGymEnv:
                                     if other != nid and other.startswith("fp_mul"):
                                         if other in self.node_consumers:
                                             self.node_consumers[other] += 1
-        self.outstanding: set = set()
-        self.max_outstanding: int = 0
-    else:
-        self.node_consumers = {}
-        self.outstanding = set()
-        self.max_outstanding = 0
-    self._sim_deadlock_warning = None
+            self.outstanding: set = set()
+            self.max_outstanding: int = 0
+        else:
+            self.node_consumers = {}
+            self.outstanding = set()
+            self.max_outstanding = 0
+        self._sim_deadlock_warning = None
 
-    return self._ready_set()
+        return self._ready_set()
 
     def _ready_set(self) -> List[str]:
-        """Return the set of nodes ready to fire (all deps satisfied)."""
+        """Return the set of nodes ready to fire (all deps satisfied).
+
+        A node is NOT ready if any of its dependencies are spilled (their
+        output is in the stack and must be reloaded first). This prevents
+        the model from issuing consumers before spilt values are restored.
+        """
         ready = []
         for node_id in self.topo_order:
             if node_id not in self.executed and self.remaining_deps[node_id] == 0:
-                ready.append(node_id)
+                node = self.graph.nodes[node_id]
+                blocked = any(
+                    dep_id in self.spilled_nodes
+                    for dep_id, _ in node.dependencies
+                )
+                if not blocked:
+                    ready.append(node_id)
         return ready
 
     @property
     def done(self) -> bool:
         return len(self.executed) == len(self.topo_order)
 
-    def step(self, node_id: str) -> Tuple[List[str], float, bool, Dict]:
+    def step(self, action_idx: int) -> Tuple[List[str], float, bool, Dict]:
         """
-        Schedule one node. Returns (ready_set, reward, done, info).
+        Schedule one action in the flat 2N action space.
 
         Args:
-            node_id: The operation node ID to emit next.
+            action_idx: 0..N-1 = Issue (if node unissued+ready) or
+                        Reload (if node spilled); N..2N-1 = Spill
+                        (if node's output is live in a register).
 
         Returns:
             ready_set: List of node IDs now ready (for next step).
             reward: 0.0 if not done; terminal reward when done.
-            done: True if all nodes scheduled.
+            done: True if all nodes scheduled AND no spills/reloads pending.
             info: Dict with metrics (only populated when done).
         """
-        if node_id not in self._ready_set():
-            return self._ready_set(), -1000.0, True, {
-                "error": f"Node '{node_id}' is not ready."
-            }
+        n = len(self.topo_order)
 
-        self.executed.add(node_id)
-        self.schedule.append(node_id)
+        if action_idx >= n:
+            # ── Spill action (N..2N-1) ─────────────────────────
+            sp_idx = action_idx - n
+            if sp_idx >= n:
+                return self._ready_set(), -1000.0, True, {
+                    "error": f"Spill action {action_idx} out of range [N, 2N)."
+                }
+            node_id = self.topo_order[sp_idx]
+            if node_id not in self.outstanding or node_id in self.spilled_nodes:
+                return self._ready_set(), -1000.0, True, {
+                    "error": f"Cannot spill '{node_id}': output not live in register."
+                }
+            self.schedule.append(("spill", node_id))
+            self.outstanding.discard(node_id)
+            self.spilled_nodes.add(node_id)
+            self.stack_pool[node_id] = len(self.schedule)
 
-        # Free dependents
-        for child_id, child_node in self.graph.nodes.items():
-            for parent_id, _ in child_node.dependencies:
-                if parent_id == node_id and child_id in self.remaining_deps:
-                    self.remaining_deps[child_id] -= 1
-        # Free implicit fp_mul dependency when Switch is scheduled
-        if node_id in self.switch_to_fpmul:
-            fpmul = self.switch_to_fpmul[node_id]
-            if fpmul in self.remaining_deps:
-                self.remaining_deps[fpmul] -= 1
+        elif self.topo_order[action_idx] in self.spilled_nodes:
+            # ── Reload action (0..N-1, node is spilled) ────────
+            node_id = self.topo_order[action_idx]
+            if node_id in self.reload_in_progress:
+                return self._ready_set(), -1000.0, True, {
+                    "error": f"Node '{node_id}' is already being reloaded."
+                }
+            self.schedule.append(("reload", node_id))
+            self.spilled_nodes.discard(node_id)
+            self.reload_in_progress.add(node_id)
+            self.outstanding.add(node_id)
 
-        # Register pressure tracking (step-loop proxy)
-        if self.max_registers is not None:
-            node = self.graph.nodes[node_id]
-            # Consume inputs: decrement consumer counts
-            for dep_id, _ in node.dependencies:
-                if dep_id in self.outstanding and dep_id in self.node_consumers:
-                    self.node_consumers[dep_id] -= 1
-                    if self.node_consumers[dep_id] <= 0:
-                        self.outstanding.discard(dep_id)
-                        self.node_consumers.pop(dep_id, None)
-            # Handle implicit fp_mul dependency
+        else:
+            # ── Issue action (0..N-1, node is unissued+ready) ──
+            node_id = self.topo_order[action_idx]
+            if node_id in self.executed or node_id not in self._ready_set():
+                return self._ready_set(), -1000.0, True, {
+                    "error": f"Node '{node_id}' is not ready for issue."
+                }
+
+            self.executed.add(node_id)
+            self.schedule.append(("issue", node_id))
+
+            # Free dependents
+            for child_id, child_node in self.graph.nodes.items():
+                for parent_id, _ in child_node.dependencies:
+                    if parent_id == node_id and child_id in self.remaining_deps:
+                        self.remaining_deps[child_id] -= 1
+            # Free implicit fp_mul dependency when Switch is scheduled
             if node_id in self.switch_to_fpmul:
                 fpmul = self.switch_to_fpmul[node_id]
-                if fpmul in self.outstanding and fpmul in self.node_consumers:
-                    self.node_consumers[fpmul] -= 1
-                    if self.node_consumers[fpmul] <= 0:
-                        self.outstanding.discard(fpmul)
-                        self.node_consumers.pop(fpmul, None)
-            # This node's output is now outstanding (only if it has consumers)
-            if self.node_consumers.get(node_id, 0) > 0:
-                self.outstanding.add(node_id)
-            self.max_outstanding = max(self.max_outstanding, len(self.outstanding))
+                if fpmul in self.remaining_deps:
+                    self.remaining_deps[fpmul] -= 1
+
+            # Register pressure tracking (step-loop proxy)
+            if self.max_registers is not None:
+                node = self.graph.nodes[node_id]
+                for dep_id, _ in node.dependencies:
+                    if dep_id in self.outstanding and dep_id in self.node_consumers:
+                        self.node_consumers[dep_id] -= 1
+                        if self.node_consumers[dep_id] <= 0:
+                            self.outstanding.discard(dep_id)
+                            self.node_consumers.pop(dep_id, None)
+                if node_id in self.switch_to_fpmul:
+                    fpmul = self.switch_to_fpmul[node_id]
+                    if fpmul in self.outstanding and fpmul in self.node_consumers:
+                        self.node_consumers[fpmul] -= 1
+                        if self.node_consumers[fpmul] <= 0:
+                            self.outstanding.discard(fpmul)
+                            self.node_consumers.pop(fpmul, None)
+                if self.node_consumers.get(node_id, 0) > 0:
+                    self.outstanding.add(node_id)
+                self.max_outstanding = max(self.max_outstanding, len(self.outstanding))
 
         done = self.done
         reward = 0.0
@@ -730,27 +779,30 @@ class SchedulingGymEnv:
 
     def _simulate_cycles(self) -> int:
         """
-        Simulate single-issue (or K-issue) execution to compute total cycles.
+        Simulate execution of the schedule (with spill/reload support).
 
-        Model: at each clock tick, up to max_exec_units ready instructions
-        issue. Each instruction takes `latency[op_type]` cycles to complete.
-        Instructions complete in background; dependents become ready only
-        after ALL their parent instructions have completed.
+        Model: the schedule is a heterogeneous list of actions:
+          ("issue", nid):  issue computation node nid (uses existing OoO model)
+          ("spill", nid):  store nid's output to stack (1-cycle latency)
+          ("reload", nid): load nid's output from stack (mem_latency-cycle latency)
 
-        The schedule order determines issue priority: at each cycle, the
-        first K ready nodes in schedule order are issued.
+        At each cycle, up to max_exec_units issue entries are scanned and
+        issued in OoO order. Spill/reload entries are processed as in-order
+        serialization points (they don't participate in the OoO scan but
+        fire as completions that affect the register file).
+
+        Register effects:
+          - Spill completes  -> nid removed from live_regs (register freed)
+          - Reload completes -> nid added back to live_regs (register occupied)
         """
         # Deterministic seed per schedule (reproducible across process restarts).
-        # Python's built-in hash() is randomized by PYTHONHASHSEED, so we
-        # build a simple polynomial hash from character codes of node names.
         h = 0
-        for nid in self.schedule:
+        for action_type, nid in self.schedule:
             for ch in nid:
                 h = (h * 127 + ord(ch)) & 0x7FFFFFFF
         random.seed(h)
         K = self.max_exec_units
         graph = self.graph
-        schedule = self.schedule
         lat = self.latency
 
         # Recompute remaining_deps (same logic as reset())
@@ -760,7 +812,7 @@ class SchedulingGymEnv:
             deps = graph.nodes[nid].dependencies
             remaining[nid] = sum(1 for d, _ in deps if d in op_set)
 
-        # Implicit fp_mul deps (mirrors reset() and CPF scheduler)
+        # Implicit fp_mul deps
         switch_to_fpmul: Dict[str, str] = {}
         for nid in self.topo_order:
             node = graph.nodes[nid]
@@ -775,16 +827,22 @@ class SchedulingGymEnv:
                                         remaining[other] += 1
                                         switch_to_fpmul[nid] = other
 
-        # completion_cycle[node] = cycle when this node finishes executing
+        # Extract issue-only schedule for the OoO ready-scan
+        issue_order: List[str] = [nid for action, nid in self.schedule if action == "issue"]
+        total_issue = len(issue_order)
+
+        # completion: issue entries only (computation results)
         completion: Dict[str, int] = {}
-        # In-flight instruction counts per opcode (for port constraint tracking)
+        # Spill/reload completions: cycle when store/load finishes
+        spill_completions: Dict[str, int] = {}   # nid -> cycle
+        reload_completions: Dict[str, int] = {}  # nid -> cycle
+
         in_flight_counts: Dict[str, int] = {}
         struct_stalls = 0
 
         cycle = 0
-        n = len(schedule)
-        freed: set = set()  # nodes whose dependents have been freed
-        MAX_CYCLES = 10_000  # safety bound
+        freed: set = set()  # issue entries whose dependents have been freed
+        MAX_CYCLES = 10_000
 
         # ── Register pressure tracking ────────────────────
         max_regs = self.max_registers
@@ -793,14 +851,13 @@ class SchedulingGymEnv:
             for nid in self.topo_order:
                 count = 0
                 for child_id, child_node in graph.nodes.items():
-                    if child_id not in remaining:
+                    if child_id not in self.topo_order:
                         continue
                     for parent_id, _ in child_node.dependencies:
                         if parent_id == nid:
                             count += 1
                 if count > 0:
                     reg_consumers[nid] = count
-            # Implicit fp_mul deps
             for nid in self.topo_order:
                 node = graph.nodes[nid]
                 if node.type == "Switch":
@@ -814,105 +871,113 @@ class SchedulingGymEnv:
                                             reg_consumers[other] += 1
             live_regs: set = set()
             max_live = 0
-            live_regs_history: List[int] = []  # per-cycle register count for integral penalty
+            live_regs_history: List[int] = []
         else:
             reg_consumers = {}
             live_regs = set()
             max_live = 0
             live_regs_history: List[int] = []
 
-        while len(completion) < n and cycle < MAX_CYCLES:
-            # Phase 0: Record register pressure at start of this cycle
-            # (before any issue processing, so it reflects pressure from the
-            #  previous cycle's completions — the pressure live during this cycle)
+        # Track schedule position for in-order spill/reload processing
+        sched_idx = 0
+        sched = self.schedule
+
+        while (len(completion) < total_issue or sched_idx < len(sched)
+               or spill_completions or reload_completions) and cycle < MAX_CYCLES:
+            # Record register pressure at start of cycle
             if max_regs is not None:
                 live_regs_history.append(len(live_regs))
 
-            # Phase 1: Free registers from nodes whose last consumer already issued
-            # (handled during issue below when reg_consumers hits 0)
+            # Phase 1: Process pending spill/reload completions
+            for nid, end_cycle in list(spill_completions.items()):
+                if end_cycle <= cycle:
+                    live_regs.discard(nid)
+                    del spill_completions[nid]
+            for nid, end_cycle in list(reload_completions.items()):
+                if end_cycle <= cycle:
+                    if nid in reg_consumers:
+                        live_regs.add(nid)
+                        max_live = max(max_live, len(live_regs))
+                    del reload_completions[nid]
 
-            # Phase 2: Issue up to K ready instructions.
-            # Scan ALL ready nodes in schedule order; pick the first that
-            # passes both port and register constraints. This prevents the
-            # bug where the first ready node blocks on a port or register
-            # stall while a subsequent ready node could issue.
+            # Phase 2: Issue up to K items (process schedule entries in order)
             issued = 0
-            while issued < K and len(completion) < n:
-                found = None
-                for nid in schedule:
-                    if nid not in completion and remaining[nid] == 0:
-                        ntype = graph.nodes[nid].type
-                        # Port constraint: skip if this node's execution unit is full
-                        if ntype in self.unit_limit:
-                            if in_flight_counts.get(ntype, 0) >= self.unit_limit[ntype]:
-                                continue
-                        # Register pressure: skip if this node can't free a register.
-                        # A consumer frees a register when its input's reg_consumers
-                        # count reaches 0. Issue it even if live_regs > max_regs when
-                        # it CAN free a register — the freed register makes room,
-                        # preventing circular deadlock.
-                        if max_regs is not None and len(live_regs) > max_regs:
-                            would_free = False
-                            for dep_id, _ in graph.nodes[nid].dependencies:
-                                if reg_consumers.get(dep_id, 0) == 1:
-                                    would_free = True
-                                    break
-                            if nid in switch_to_fpmul:
-                                fpmul = switch_to_fpmul[nid]
-                                if reg_consumers.get(fpmul, 0) == 1:
-                                    would_free = True
-                            if not would_free:
-                                continue
-                        found = nid
+            while issued < K and sched_idx < len(sched):
+                action_type, nid = sched[sched_idx]
+                sched_idx += 1
+
+                if action_type == "issue":
+                    # Standard OoO issue: check if nid is ready
+                    if remaining.get(nid, -1) != 0:
+                        # Not ready — stall on this entry. Re-queue for next cycle.
+                        sched_idx -= 1
                         break
 
-                if found is None:
-                    # No viable node this cycle -> stall.
-                    # Count structural stall if a ready node was blocked by port.
-                    for nid in schedule:
-                        if nid not in completion and remaining[nid] == 0:
-                            ntype = graph.nodes[nid].type
-                            if ntype in self.unit_limit:
-                                struct_stalls += 1
+                    ntype = graph.nodes[nid].type
+                    # Port constraint
+                    if ntype in self.unit_limit:
+                        if in_flight_counts.get(ntype, 0) >= self.unit_limit[ntype]:
+                            sched_idx -= 1
+                            struct_stalls += 1
+                            break
+                    # Register pressure
+                    if max_regs is not None and len(live_regs) > max_regs:
+                        would_free = False
+                        for dep_id, _ in graph.nodes[nid].dependencies:
+                            if reg_consumers.get(dep_id, 0) == 1:
+                                would_free = True
                                 break
-                    break
+                        if nid in switch_to_fpmul:
+                            fpmul = switch_to_fpmul[nid]
+                            if reg_consumers.get(fpmul, 0) == 1:
+                                would_free = True
+                        if not would_free:
+                            sched_idx -= 1
+                            break
 
-                # Issue this instruction: it completes after its latency
-                # (deterministic or stochastic depending on latency_distribution)
-                node_type_found = graph.nodes[found].type
-                if node_type_found in self.latency_distribution:
-                    min_l, max_l = self.latency_distribution[node_type_found]
-                    l = random.randint(min_l, max_l)
-                else:
-                    l = lat.get(node_type_found, 1)
-                completion[found] = cycle + l
-                issued += 1
-                in_flight_counts[node_type_found] = in_flight_counts.get(node_type_found, 0) + 1
+                    # Issue: schedule completion
+                    if ntype in self.latency_distribution:
+                        min_l, max_l = self.latency_distribution[ntype]
+                        l = random.randint(min_l, max_l)
+                    else:
+                        l = lat.get(ntype, 1)
+                    completion[nid] = cycle + l
+                    issued += 1
+                    in_flight_counts[ntype] = in_flight_counts.get(ntype, 0) + 1
 
-                # Decrement consumer counts for inputs (register freed when last consumer issues)
-                if max_regs is not None:
-                    for dep_id, _ in graph.nodes[found].dependencies:
-                        if dep_id in reg_consumers:
-                            reg_consumers[dep_id] -= 1
-                            if reg_consumers[dep_id] <= 0:
-                                live_regs.discard(dep_id)
-                                reg_consumers.pop(dep_id, None)
-                    if found in switch_to_fpmul:
-                        fpmul = switch_to_fpmul[found]
-                        if fpmul in reg_consumers:
-                            reg_consumers[fpmul] -= 1
-                            if reg_consumers[fpmul] <= 0:
-                                live_regs.discard(fpmul)
-                                reg_consumers.pop(fpmul, None)
+                    # Decrement consumer counts
+                    if max_regs is not None:
+                        for dep_id, _ in graph.nodes[nid].dependencies:
+                            if dep_id in reg_consumers:
+                                reg_consumers[dep_id] -= 1
+                                if reg_consumers[dep_id] <= 0:
+                                    live_regs.discard(dep_id)
+                                    reg_consumers.pop(dep_id, None)
+                        if nid in switch_to_fpmul:
+                            fpmul = switch_to_fpmul[nid]
+                            if fpmul in reg_consumers:
+                                reg_consumers[fpmul] -= 1
+                                if reg_consumers[fpmul] <= 0:
+                                    live_regs.discard(fpmul)
+                                    reg_consumers.pop(fpmul, None)
+
+                elif action_type == "spill":
+                    # 1-cycle store latency
+                    spill_completions[nid] = cycle + 1
+                    issued += 1  # counts as an issued slot (uses memory port)
+
+                elif action_type == "reload":
+                    # mem_latency-cycle load latency
+                    reload_completions[nid] = cycle + self.mem_latency
+                    issued += 1  # counts as an issued slot
 
             # Advance clock
             cycle += 1
 
-            # Free dependents of nodes that completed exactly at this cycle.
+            # Free dependents of issue entries that completed
             for nid in list(completion.keys()):
                 if nid not in freed and completion[nid] <= cycle:
                     freed.add(nid)
-                    # Decrement in-flight count (port slot freed)
                     completed_type = graph.nodes[nid].type
                     if completed_type in self.unit_limit:
                         in_flight_counts[completed_type] = max(
@@ -926,20 +991,17 @@ class SchedulingGymEnv:
                         fpmul = switch_to_fpmul[nid]
                         if fpmul in remaining:
                             remaining[fpmul] -= 1
-                    # Register allocation: completed node's result written to register
-                    # Only allocate if the node has op-consumers (output-only nodes
-                    # bypass the register file via the output port).
                     if max_regs is not None and nid in reg_consumers:
                         live_regs.add(nid)
                         max_live = max(max_live, len(live_regs))
 
-
-        if len(completion) < n:
-            stranded = [nid for nid in schedule if nid not in completion]
+        # Deadlock/stall diagnostic
+        if len(completion) < total_issue:
+            stranded = [nid for nid in issue_order if nid not in completion]
             stranded_types = [f"{n}({graph.nodes[n].type})" for n in stranded]
             self._sim_deadlock_warning = (
-                f"MAX_CYCLES reached: {n - len(completion)}/{n} ops stranded "
-                f"{stranded_types}, live_regs={len(live_regs)}, "
+                f"MAX_CYCLES reached: {total_issue - len(completion)}/{total_issue} "
+                f"ops stranded {stranded_types}, live_regs={len(live_regs)}, "
                 f"struct_stalls={struct_stalls}"
             )
         else:
@@ -953,6 +1015,10 @@ class SchedulingGymEnv:
     def _generate_dfasm(self) -> str:
         """
         Serialize the graph into a DF-ASM program in schedule order.
+
+        Only "issue" actions generate DF-ASM nodes; spill/reload are
+        meta-operations that affect the register file but don't appear
+        in the final program.
 
         All send directives are auto-generated from data dependencies.
         For Switch nodes, send_true / send_false are generated based
@@ -973,7 +1039,10 @@ class SchedulingGymEnv:
                     outgoing_edges[parent_id] = []
                 outgoing_edges[parent_id].append((child_id, slot))
 
-        for node_id in self.schedule:
+        for entry in self.schedule:
+            action_type, node_id = entry
+            if action_type != "issue":
+                continue  # skip spill/reload
             compute_node = self.graph.nodes[node_id]
             opcode = NodeType.to_opcode(compute_node.type)
             is_switch = compute_node.type == NodeType.SWITCH
@@ -993,20 +1062,16 @@ class SchedulingGymEnv:
                         merge_target = (child_id, slot)
                         break
 
-                # Find the fp_mul that feeds the SAME Merge as this Switch.
-                # This handles multi-Switch graphs correctly: each Switch
-                # gets its own fp_mul (the one that feeds its Merge).
+                # Find the fp_mul that feeds the SAME Merge as this Switch
                 fp_mul_target = None
                 if merge_target:
                     merge_id = merge_target[0]
                     merge_node = self.graph.nodes.get(merge_id)
                     if merge_node:
-                        # Find the fp_mul that has an edge to this Merge
                         for dep_id, dep_slot in merge_node.dependencies:
                             if dep_id != node_id and dep_id.startswith("fp_mul"):
                                 fp_mul_target = (dep_id, 0)
                                 break
-                # Fallback: if no merge-targeted fp_mul, scan topo
                 if fp_mul_target is None:
                     for nid in self.topo_order:
                         if nid.startswith("fp_mul"):
@@ -1020,8 +1085,6 @@ class SchedulingGymEnv:
                     tgt, slot = fp_mul_target
                     lines.append(f"    (send_false {tgt} {slot})")
 
-                # Also emit normal send for any remaining data edges
-                # (e.g., Switch -> other consumers besides Merge)
                 merge_name = merge_target[0] if merge_target else None
                 for child_id, slot in outgoing_edges.get(node_id, []):
                     if child_id != merge_name:

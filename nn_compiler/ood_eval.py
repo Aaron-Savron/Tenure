@@ -107,6 +107,9 @@ class OODBenchmark:
 
     def _evaluate_model(self, graph, policy) -> Dict[str, Any]:
         """Evaluate the policy on a single graph. Returns full metrics dict."""
+        # Build topo_order index mapping for action index conversion
+        topo = graph.get_topological_order()
+
         env = SchedulingGymEnv(
             graph, None, [],
             max_exec_units=self.k, latency=DEFAULT_LATENCY,
@@ -134,24 +137,31 @@ class OODBenchmark:
                     for k, v in obs.items()
                 }
                 probs = policy._get_priority_distribution(obs_dev)
-            nidx = torch.argmax(probs).item()
-            chosen = obs["node_names"][nidx]
+            action_idx = torch.argmax(probs).item()
+            N = len(topo)
 
+            # Map 2N action index to topo_order node for CPD tracking
+            if action_idx < N:
+                chosen_nid = topo[action_idx]
+            else:
+                chosen_nid = topo[action_idx - N]
+
+            # CPD tracking uses n_ready_mask (N-length, indexed by node_names)
             node_names = obs["node_names"]
-            ready_indices = [
-                j for j, name in enumerate(node_names) if obs["ready_mask"][j]
-            ]
+            n_ready = obs.get("n_ready_mask", obs.get("ready_mask"))
+            # Get ready indices in node_names space
+            ready_indices = [j for j, name in enumerate(node_names) if
+                            j < len(n_ready) and n_ready[j]]
 
-            if len(ready_indices) > 1:
+            if len(ready_indices) > 1 and action_idx < N:
                 cpd_vals = []
-                for j, name in enumerate(node_names):
-                    if obs["ready_mask"][j]:
-                        cpd_vals.append(obs["x"][j, 11].item())
+                for j in ready_indices:
+                    cpd_vals.append(obs["x"][j, 11].item())
 
                 max_cpd = max(cpd_vals)
-                chosen_cpd = obs["x"][nidx, 11].item()
+                chosen_cpd = obs["x"][node_names.index(chosen_nid), 11].item() if chosen_nid in node_names else 0
                 is_max_cpd = (chosen_cpd >= max_cpd - 1e-6)
-                reg_p = obs["x"][nidx, 12].item()
+                reg_p = obs["x"][node_names.index(chosen_nid), 12].item() if chosen_nid in node_names else 0
 
                 cpd_picks += 1 if is_max_cpd else 0
                 total_steps += 1
@@ -166,7 +176,7 @@ class OODBenchmark:
                     low_cpd += 1 if is_max_cpd else 0
                     low_steps += 1
 
-            _, _, _, info = env.step(chosen)
+            _, _, _, info = env.step(action_idx)
 
         cycles = info.get("cycles", 0)
         peak = info.get("max_live_registers", 0)
@@ -174,7 +184,7 @@ class OODBenchmark:
         spill_steps = info.get("spill_steps", 0)
         struct_stalls = info.get("struct_stalls", 0)
 
-        # CPF baseline
+        # CPF baseline (issues only — no spill/reload, uses topo indices)
         cpf_sched = schedule_cpf(graph)
         cpf_env = SchedulingGymEnv(
             graph, None, [],
@@ -186,7 +196,8 @@ class OODBenchmark:
         )
         cpf_env.reset()
         for nid in cpf_sched:
-            _, _, _, cpf_info = cpf_env.step(nid)
+            cpf_idx = topo.index(nid)
+            _, _, _, cpf_info = cpf_env.step(cpf_idx)
         cpf_cycles = cpf_info.get("cycles", 0)
         cpf_peak = cpf_info.get("max_live_registers", 0)
         cpf_spill = cpf_info.get("spill_penalty", 0)
@@ -197,7 +208,7 @@ class OODBenchmark:
             return 100 * p / max(t, 1)
 
         return {
-            "n_ops": len(graph.get_topological_order()),
+            "n_ops": len(topo),
             "model_cycles": cycles,
             "cpf_cycles": cpf_cycles,
             "cycle_diff": cycles - cpf_cycles,
@@ -239,12 +250,14 @@ class OODBenchmark:
         # Load model
         print(f"Loading checkpoint: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        policy = SchedulingPolicy(node_feat_dim=13).to(self.device)
+        policy = SchedulingPolicy(node_feat_dim=15).to(self.device)
         policy.load_state_dict(checkpoint["policy_state_dict"], strict=True)
         policy.eval()
 
-        w13 = policy.input_proj.weight.data[12]
-        print(f"  Column 13 norm: {w13.norm().item():.4f}")
+        # Print feature column norms (for 15-dim feature space)
+        for col in range(15):
+            w = policy.input_proj.weight.data[col]
+            print(f"  Col {col} norm: {w.norm().item():.4f}")
         print(f"  Config: K={self.k}, max_registers={self.max_registers}, "
               f"alpha={self.alpha} (integral)")
         print()

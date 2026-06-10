@@ -211,12 +211,17 @@ def encode_scheduling_obs(env):
       [9]    = node height (longest hop path to output, normalized)
       [10]   = downstream latency sum (total descendant work, normalized)
       [11]   = CPD: critical path distance (longest latency path to output,
-               normalized by max CPD across all nodes)
-      [12]   = register pressure: outstanding_values / max_registers (capped at 1.0),
-               0.0 when max_registers is not set (unlimited)
+               normalized by max CPD across all nodes)      [12]   = register pressure: outstanding_values / max_registers (capped at 1.0),
+              0.0 when max_registers is not set (unlimited)
+      [13]   = Is_Spilled: 1.0 if node's output is currently in the stack pool
+               (spilled out of register file), 0.0 otherwise.
+      [14]   = Remaining_Reloads: count of yet-to-issue consumers for this
+               spilled value (0 for non-spilled nodes).
 
-    Ready mask: [num_nodes] boolean. Only op nodes (not Input/Output)
-                that are ready and not yet executed are valid actions.
+    Action mask: [2 * num_op_nodes] boolean where:
+      0..N-1: Issue (node unissued + ready + not spilled) or
+              Reload (node spilled + not reloading)
+      N..2N-1: Spill (node's output live in a register)
     """
     from .scheduler_baseline import critical_path_height
     from .compiler_env import DEFAULT_LATENCY
@@ -277,7 +282,7 @@ def encode_scheduling_obs(env):
         "Input": 0, "Mul": 1, "Add": 2, "Switch": 3,
         "CmpGeZ": 4, "Output": 5, "Merge": 6,
     }
-    feat_dim = 13
+    feat_dim = 15
     x = torch.zeros(num_nodes, feat_dim)
 
     ready_set = set(env._ready_set())
@@ -317,17 +322,46 @@ def encode_scheduling_obs(env):
         # Feature 12: register pressure (global, same for all nodes)
         x[i, 12] = reg_pressure
 
-    # Ready mask: only op nodes that are ready (not executed, all deps met)
-    ready_mask = torch.zeros(num_nodes, dtype=torch.bool)
+        # Feature 13: Is_Spilled — 1.0 if node's output is in the stack pool
+        x[i, 13] = 1.0 if name in env.spilled_nodes else 0.0
+
+        # Feature 14: Remaining_Reloads — consumers still needing this spilled value
+        if name in env.spilled_nodes and name in env.node_consumers:
+            x[i, 14] = float(env.node_consumers[name])
+        else:
+            x[i, 14] = 0.0
+
+    # ── N-length ready mask (for CPD tracking, backward compat) ──
+    n_ready_mask = torch.zeros(len(node_names), dtype=torch.bool)
     for name in ready_set:
         if name in name_to_idx:
-            ready_mask[name_to_idx[name]] = True
+            n_ready_mask[name_to_idx[name]] = True
+
+    # ── Action mask: 2N-length for flat Issue/Reload + Spill space ──
+    N = len(env.topo_order)
+    action_mask = torch.zeros(2 * N, dtype=torch.bool)
+    for i, nid in enumerate(env.topo_order):
+        # Issue: unissued + ready + not spilled
+        unissued_ready = (nid not in env.executed and
+                          nid in ready_set and
+                          nid not in env.spilled_nodes)
+        # Reload: spilled + not already reloading
+        can_reload = (nid in env.spilled_nodes and
+                      nid not in env.reload_in_progress)
+        action_mask[i] = unissued_ready or can_reload
+
+        # Spill: output is live in a register (outstanding + not spilled)
+        can_spill = (nid in env.outstanding and
+                     nid not in env.spilled_nodes)
+        action_mask[N + i] = can_spill
 
     return {
         "x": x,
         "edge_index": edge_index,
-        "ready_mask": ready_mask,
+        "ready_mask": action_mask,  # 2N-length for policy
+        "n_ready_mask": n_ready_mask,  # N-length for CPD tracking
         "node_names": node_names,
+        "action_mask": action_mask,
     }
 
 
@@ -337,17 +371,18 @@ def encode_scheduling_obs(env):
 
 class SchedulingPolicy(nn.Module):
     """
-    GNN policy for instruction scheduling.
+    GNN policy for instruction scheduling with flat 2N action space.
 
-    Action head outputs [num_nodes, 1] priority scores per node.
-    The ready mask is applied before softmax to restrict choices
-    to nodes whose dependencies are satisfied.
+    Action head outputs [num_nodes, 2] scores per node (Issue/Reload, Spill).
+    Flattened to [2 * num_nodes] and masked with action_mask:
+      0..N-1: Issue (if ready + unissued) or Reload (if spilled)
+      N..2N-1: Spill (if node's output is live in a register)
 
-    Default: 13-dim node features (12 structural + register pressure),
+    Default: 15-dim node features (13 structural + spilled + reloads),
     256-dim hidden, 4-layer 4-head GAT.
     """
 
-    def __init__(self, node_feat_dim=13, hidden_dim=256, num_layers=4):
+    def __init__(self, node_feat_dim=15, hidden_dim=256, num_layers=4):
         super().__init__()
         self.hidden_dim = hidden_dim
 
@@ -361,11 +396,11 @@ class SchedulingPolicy(nn.Module):
             self.gat_convs.append(conv)
             self.gat_lin.append(lin)
 
-        # Priority head: one scalar per node
+        # Priority head: two scores per node (Issue/Reload, Spill)
         self.priority_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, 2),
         )
 
     def _encode(self, obs):
@@ -379,32 +414,45 @@ class SchedulingPolicy(nn.Module):
         return h
 
     def _get_priority_distribution(self, obs):
-        """Compute masked priority distribution over nodes."""
+        """Compute masked 2N action distribution."""
         h = self._encode(obs)
-        scores = self.priority_head(h).squeeze(-1)  # [num_nodes]
-        masked = scores.clone()
-        masked[~obs["ready_mask"]] = -float("inf")
-        probs = F.softmax(masked, dim=0)
+        scores = self.priority_head(h)  # [num_nodes, 2]
+        flat_scores = scores.flatten()   # [2 * num_nodes]
+        mask = obs.get("action_mask", obs.get("ready_mask"))
+        masked = flat_scores.clone()
+        masked[~mask] = -float("inf")
+        if masked.max() == -float("inf"):
+            # All masked — return uniform over any valid actions
+            # (shouldn't happen in normal operation)
+            valid = mask.float()
+            if valid.sum() > 0:
+                probs = valid / valid.sum()
+            else:
+                probs = torch.ones_like(flat_scores) / len(flat_scores)
+        else:
+            probs = F.softmax(masked, dim=0)
         return probs
 
     def sample_action(self, obs):
-        """Sample a node from the ready set."""
+        """Sample a 2N action index."""
         probs = self._get_priority_distribution(obs)
+        mask = obs.get("action_mask", obs.get("ready_mask"))
 
-        if not obs["ready_mask"].any() or probs.sum() == 0:
+        if not mask.any() or probs.sum() == 0:
             return None, torch.tensor(0.0)
 
         dist = Categorical(probs)
-        node_idx = dist.sample()
-        log_prob = dist.log_prob(node_idx)
-        return node_idx.item(), log_prob
+        action_idx = dist.sample()
+        log_prob = dist.log_prob(action_idx)
+        return action_idx.item(), log_prob
 
     def forward(self, obs):
         return self.sample_action(obs)
 
     def get_entropy(self, obs):
         probs = self._get_priority_distribution(obs)
-        if not obs["ready_mask"].any() or probs.sum() == 0:
+        mask = obs.get("action_mask", obs.get("ready_mask"))
+        if not mask.any() or probs.sum() == 0:
             return torch.tensor(0.0)
         dist = Categorical(probs)
         return dist.entropy()
