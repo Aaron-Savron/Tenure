@@ -1,0 +1,92 @@
+; ╔══════════════════════════════════════════════════════╗
+; ║  2×2 Matrix Multiply — Dataflow ASM                ║
+; ║  C = A × B                                          ║
+; ║                                                      ║
+; ║  A = [[a00, a01], [a10, a11]]                       ║
+; ║  B = [[b00, b01], [b10, b11]]                       ║
+; ║                                                      ║
+; ║  C[0,0] = a00·b00 + a01·b10                        ║
+; ║  C[0,1] = a00·b01 + a01·b11                        ║
+; ║  C[1,0] = a10·b00 + a11·b10                        ║
+; ║  C[1,1] = a10·b01 + a11·b11                        ║
+; ╚══════════════════════════════════════════════════════╝
+
+(input a00 a01 a10 a11 b00 b01 b10 b11)
+
+; ── C[0,0] = a00·b00 + a01·b10 ──────────────────────
+(node mul_00_00 Mul
+    (wait a00 0)
+    (wait b00 1)
+    (send add_00 0)
+)
+
+(node mul_00_01_10 Mul
+    (wait a01 0)
+    (wait b10 1)
+    (send add_00 1)
+)
+
+(node add_00 Add
+    (wait mul_00_00 0)
+    (wait mul_00_01_10 1)
+    (send c00 0)
+)
+
+; ── C[0,1] = a00·b01 + a01·b11 ──────────────────────
+(node mul_01_00 Mul
+    (wait a00 0)
+    (wait b01 1)
+    (send add_01 0)
+)
+
+(node mul_01_11 Mul
+    (wait a01 0)
+    (wait b11 1)
+    (send add_01 1)
+)
+
+(node add_01 Add
+    (wait mul_01_00 0)
+    (wait mul_01_11 1)
+    (send c01 0)
+)
+
+; ── C[1,0] = a10·b00 + a11·b10 ──────────────────────
+(node mul_10_00 Mul
+    (wait a10 0)
+    (wait b00 1)
+    (send add_10 0)
+)
+
+(node mul_10_10 Mul
+    (wait a11 0)
+    (wait b10 1)
+    (send add_10 1)
+)
+
+(node add_10 Add
+    (wait mul_10_00 0)
+    (wait mul_10_10 1)
+    (send c10 0)
+)
+
+; ── C[1,1] = a10·b01 + a11·b11 ──────────────────────
+(node mul_11_01 Mul
+    (wait a10 0)
+    (wait b01 1)
+    (send add_11 0)
+)
+
+(node mul_11_11 Mul
+    (wait a11 0)
+    (wait b11 1)
+    (send add_11 1)
+)
+
+(node add_11 Add
+    (wait mul_11_01 0)
+    (wait mul_11_11 1)
+    (send c11 0)
+)
+
+(output c00 c01 c10 c11)
