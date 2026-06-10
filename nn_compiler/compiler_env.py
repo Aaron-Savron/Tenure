@@ -523,6 +523,7 @@ class SchedulingGymEnv:
         unit_limit: Optional[Dict[str, int]] = None,
         latency_distribution: Optional[Dict[str, Tuple[int, int]]] = None,
         mem_latency: int = 10,
+        partial_credit_per_issue: float = 0.0,
     ):
         self.graph = graph
         self.vm_bridge = vm_bridge
@@ -535,6 +536,7 @@ class SchedulingGymEnv:
         self.unit_limit = unit_limit if unit_limit is not None else {}
         self.latency_distribution = latency_distribution if latency_distribution is not None else {}
         self.mem_latency = mem_latency
+        self.partial_credit_per_issue = partial_credit_per_issue
         # Cache node_names ordering (inputs + topo + outputs) for action index mapping
         self.__node_names = self.graph.inputs + self.topo_order + self.graph.outputs
         self.reset()
@@ -604,6 +606,7 @@ class SchedulingGymEnv:
             self.outstanding = set()
             self.max_outstanding = 0
         self._sim_deadlock_warning = None
+        self._accumulated_partial_credit = 0.0
 
         return self._ready_set()
 
@@ -699,6 +702,7 @@ class SchedulingGymEnv:
 
             self.executed.add(node_id)
             self.schedule.append(("issue", node_id))
+            self._accumulated_partial_credit += self.partial_credit_per_issue
 
             # Free dependents
             for child_id, child_node in self.graph.nodes.items():
@@ -789,6 +793,10 @@ class SchedulingGymEnv:
                 # No VM and no simulator — should not happen in practice
                 reward = -1000.0
                 info = {"error": "No VM bridge and no simulator configured."}
+
+            # Add accumulated partial credit (reward per successfully issued instruction)
+            reward += self._accumulated_partial_credit
+            info["partial_credit"] = self._accumulated_partial_credit
 
         return self._ready_set(), reward, done, info
 

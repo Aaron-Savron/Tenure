@@ -1829,6 +1829,7 @@ def chaos_annealing_train(
                 mem_latency=current_lat,
                 unit_limit=current_unit_limit,
                 latency_distribution=current_lat_dist,
+                partial_credit_per_issue=partial_credit_per_issue,
             )
             cpf_env.reset()
             for nid in cpf_sched:
@@ -1855,6 +1856,7 @@ def chaos_annealing_train(
             mem_latency=current_lat,
             unit_limit=current_unit_limit,
             latency_distribution=current_lat_dist,
+            partial_credit_per_issue=partial_credit_per_issue,
         )
 
         # ═══════════════════════════════════════════════
@@ -2160,6 +2162,7 @@ def hierarchical_phase4_train(
     checkpoint_dir: str = "checkpoints",
     device: str = "cpu",
     dry_run: bool = False,
+    partial_credit_per_issue: float = 0.1,
 ) -> dict:
     """
     Phase 4: Hierarchical GATv2 Training with Burn-in + Scaled Chaos.
@@ -2381,6 +2384,7 @@ def hierarchical_phase4_train(
                 mem_latency=current_lat,
                 unit_limit=current_unit_limit,
                 latency_distribution=current_lat_dist,
+                partial_credit_per_issue=partial_credit_per_issue,
             )
             cpf_env.reset()
             for nid in cpf_sched:
@@ -2406,6 +2410,7 @@ def hierarchical_phase4_train(
             mem_latency=current_lat,
             unit_limit=current_unit_limit,
             latency_distribution=current_lat_dist,
+            partial_credit_per_issue=partial_credit_per_issue,
         )
 
         # ═══════════════════════════════════════════════
