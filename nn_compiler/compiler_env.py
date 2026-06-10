@@ -590,14 +590,15 @@ class SchedulingGymEnv:
                                     if other != nid and other.startswith("fp_mul"):
                                         if other in self.node_consumers:
                                             self.node_consumers[other] += 1
-            self.outstanding: set = set()
-            self.max_outstanding: int = 0
-        else:
-            self.node_consumers = {}
-            self.outstanding = set()
-            self.max_outstanding = 0
+        self.outstanding: set = set()
+        self.max_outstanding: int = 0
+    else:
+        self.node_consumers = {}
+        self.outstanding = set()
+        self.max_outstanding = 0
+    self._sim_deadlock_warning = None
 
-        return self._ready_set()
+    return self._ready_set()
 
     def _ready_set(self) -> List[str]:
         """Return the set of nodes ready to fire (all deps satisfied)."""
@@ -688,6 +689,8 @@ class SchedulingGymEnv:
                 info["cycles_source"] = "simulated"
                 info["spill_penalty"] = spill_penalty
                 info["struct_stalls"] = self._sim_struct_stalls
+                if self._sim_deadlock_warning:
+                    info["deadlock_warning"] = self._sim_deadlock_warning
                 if self.max_registers is not None:
                     info["max_live_registers"] = self._sim_max_live
                     info["registers"] = self.max_registers
@@ -708,6 +711,8 @@ class SchedulingGymEnv:
                 info = {"cycles": sim_cycles, "max_queue": 0, "cycles_source": "simulated"}
                 info["spill_penalty"] = spill_penalty
                 info["struct_stalls"] = self._sim_struct_stalls
+                if self._sim_deadlock_warning:
+                    info["deadlock_warning"] = self._sim_deadlock_warning
                 if self.max_registers is not None:
                     info["max_live_registers"] = self._sim_max_live
                     info["registers"] = self.max_registers
@@ -826,53 +831,55 @@ class SchedulingGymEnv:
             # Phase 1: Free registers from nodes whose last consumer already issued
             # (handled during issue below when reg_consumers hits 0)
 
-            # Phase 2: Issue up to K ready instructions (subject to register pressure)
+            # Phase 2: Issue up to K ready instructions.
+            # Scan ALL ready nodes in schedule order; pick the first that
+            # passes both port and register constraints. This prevents the
+            # bug where the first ready node blocks on a port or register
+            # stall while a subsequent ready node could issue.
             issued = 0
             while issued < K and len(completion) < n:
-                # Find the first ready, unissued node in schedule order
                 found = None
                 for nid in schedule:
                     if nid not in completion and remaining[nid] == 0:
+                        ntype = graph.nodes[nid].type
+                        # Port constraint: skip if this node's execution unit is full
+                        if ntype in self.unit_limit:
+                            if in_flight_counts.get(ntype, 0) >= self.unit_limit[ntype]:
+                                continue
+                        # Register pressure: skip if this node can't free a register.
+                        # A consumer frees a register when its input's reg_consumers
+                        # count reaches 0. Issue it even if live_regs > max_regs when
+                        # it CAN free a register — the freed register makes room,
+                        # preventing circular deadlock.
+                        if max_regs is not None and len(live_regs) > max_regs:
+                            would_free = False
+                            for dep_id, _ in graph.nodes[nid].dependencies:
+                                if reg_consumers.get(dep_id, 0) == 1:
+                                    would_free = True
+                                    break
+                            if nid in switch_to_fpmul:
+                                fpmul = switch_to_fpmul[nid]
+                                if reg_consumers.get(fpmul, 0) == 1:
+                                    would_free = True
+                            if not would_free:
+                                continue
                         found = nid
                         break
 
                 if found is None:
-                    # No ready node — structural bubble. Advance clock.
+                    # No viable node this cycle -> stall.
+                    # Count structural stall if a ready node was blocked by port.
+                    for nid in schedule:
+                        if nid not in completion and remaining[nid] == 0:
+                            ntype = graph.nodes[nid].type
+                            if ntype in self.unit_limit:
+                                struct_stalls += 1
+                                break
                     break
-
-                # ── Port constraint check ────────────────────
-                # If this node's opcode type exceeds the physical unit limit,
-                # stall structurally regardless of register pressure.
-                node_type_found = graph.nodes[found].type
-                if node_type_found in self.unit_limit:
-                    if in_flight_counts.get(node_type_found, 0) >= self.unit_limit[node_type_found]:
-                        struct_stalls += 1
-                        break  # structural stall — unit busy
-
-                # Register pressure check: stall only if registers are over
-                # capacity AND the next ready instruction cannot free any
-                # register. A consumer frees a register when its input's
-                # reg_consumers count reaches 0. If the consumer CAN free a
-                # register, issue it even if live_regs > max_regs — the freed
-                # register makes room, preventing circular deadlock.
-                if max_regs is not None and len(live_regs) > max_regs:
-                    # Check if this instruction would free at least 1 register.
-                    # Only the LAST consumer of a value actually frees its
-                    # register (reg_consumers[dep] == 1 before decrement).
-                    would_free = False
-                    for dep_id, _ in graph.nodes[found].dependencies:
-                        if reg_consumers.get(dep_id, 0) == 1:
-                            would_free = True
-                            break
-                    if found in switch_to_fpmul:
-                        fpmul = switch_to_fpmul[found]
-                        if reg_consumers.get(fpmul, 0) == 1:
-                            would_free = True
-                    if not would_free:
-                        break  # No register can be freed — stall
 
                 # Issue this instruction: it completes after its latency
                 # (deterministic or stochastic depending on latency_distribution)
+                node_type_found = graph.nodes[found].type
                 if node_type_found in self.latency_distribution:
                     min_l, max_l = self.latency_distribution[node_type_found]
                     l = random.randint(min_l, max_l)
@@ -927,10 +934,21 @@ class SchedulingGymEnv:
                         max_live = max(max_live, len(live_regs))
 
 
+        if len(completion) < n:
+            stranded = [nid for nid in schedule if nid not in completion]
+            stranded_types = [f"{n}({graph.nodes[n].type})" for n in stranded]
+            self._sim_deadlock_warning = (
+                f"MAX_CYCLES reached: {n - len(completion)}/{n} ops stranded "
+                f"{stranded_types}, live_regs={len(live_regs)}, "
+                f"struct_stalls={struct_stalls}"
+            )
+        else:
+            self._sim_deadlock_warning = None
+
         self._sim_max_live = max_live
         self._sim_live_regs_history = live_regs_history
         self._sim_struct_stalls = struct_stalls
-        return max(completion.values())
+        return max(completion.values()) if completion else MAX_CYCLES
 
     def _generate_dfasm(self) -> str:
         """
