@@ -140,9 +140,10 @@ def collect_scheduling_episode(env, policy, device="cpu"):
 
         node_idx, log_prob = policy(obs_on_device)
         if node_idx is None:
-            final_reward = -1000.0
-            final_info = {"error": "No valid actions (empty ready set)"}
-            break
+            partial_credit = getattr(env, '_accumulated_partial_credit', 0.0)
+            final_reward = -1000.0 + partial_credit
+            final_info = {"error": "No valid actions (empty ready set)",
+                          "partial_credit": partial_credit}
 
         node_id = obs["node_names"][node_idx]
         log_probs.append(log_prob)
@@ -213,9 +214,10 @@ def collect_scheduling_episode_ppo(env, policy, device="cpu"):
 
         node_idx, log_prob = policy(obs_on_device)
         if node_idx is None:
-            final_reward = -1000.0
-            final_info = {"error": "No valid actions (empty ready set)"}
-            break
+            partial_credit = getattr(env, '_accumulated_partial_credit', 0.0)
+            final_reward = -1000.0 + partial_credit
+            final_info = {"error": "No valid actions (empty ready set)",
+                          "partial_credit": partial_credit}
 
         node_id = obs["node_names"][node_idx]
         old_log_probs.append(log_prob.detach())
@@ -470,9 +472,12 @@ def collect_scheduling_episode_ppo_v2(env, policy, device="cpu"):
 
         action_idx, log_prob = policy(obs_on_device)
         if action_idx is None:
-            final_reward = -1000.0
-            final_info = {"error": "No valid actions (empty action mask)"}
-            break
+            # Include accumulated partial credit so PPO sees gradient signal
+            # even when the policy deadlocks mid-episode.
+            partial_credit = getattr(env, '_accumulated_partial_credit', 0.0)
+            final_reward = -1000.0 + partial_credit
+            final_info = {"error": "No valid actions (empty action mask)",
+                          "partial_credit": partial_credit}
 
         old_log_probs.append(log_prob.detach())
         observations.append(obs_on_device)
