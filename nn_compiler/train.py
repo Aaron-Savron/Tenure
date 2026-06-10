@@ -6,6 +6,7 @@ reward from the Rust VM (minimizing cycles and queue depth).
 """
 
 import os
+import random
 import sys
 import torch
 import torch.nn as nn
@@ -447,13 +448,21 @@ def train(
 #  v2: Active-Spilling PPO Collection and Training
 # ═══════════════════════════════════════════════════════════════
 
-def collect_scheduling_episode_ppo_v2(env, policy, device="cpu"):
+def collect_scheduling_episode_ppo_v2(env, policy, device="cpu",
+                                       cpf_blend_epsilon=0.0,
+                                       cpf_blend_schedule=None):
     """
     v2 PPO episode collection for the flat 2N action space.
 
     Unlike v1, the policy returns an action_idx in [0, 2N-1]
     that maps directly to env.step(action_idx). No node name
     lookup needed.
+
+    When cpf_blend_epsilon > 0 and cpf_blend_schedule is provided,
+    epsilon-greedy blending is active: with probability epsilon,
+    the next valid CPF action is used instead of the policy's choice.
+    The log_prob is still computed under the current policy so PPO
+    can learn from the blended trajectory.
 
     Returns:
         final_reward, old_log_probs, observations, actions (int), final_info
@@ -482,6 +491,23 @@ def collect_scheduling_episode_ppo_v2(env, policy, device="cpu"):
                           "partial_credit": partial_credit}
 
             break
+
+        # ── Epsilon-greedy CPF blending (burn-in guidance) ──
+        cpf_used = False
+        if cpf_blend_epsilon > 0 and cpf_blend_schedule is not None:
+            if random.random() < cpf_blend_epsilon:
+                ready = set(env._ready_set())
+                for cpf_nid in cpf_blend_schedule:
+                    if cpf_nid in ready and cpf_nid not in env.executed:
+                        cpf_idx = obs["node_names"].index(cpf_nid)
+                        # Get log_prob under current policy for proper PPO gradient
+                        probs = policy._get_priority_distribution(obs_on_device)
+                        dist = Categorical(probs)
+                        cpf_tensor = torch.tensor(cpf_idx, device=device)
+                        action_idx = cpf_idx
+                        log_prob = dist.log_prob(cpf_tensor)
+                        break
+
         old_log_probs.append(log_prob.detach())
         observations.append(obs_on_device)
         actions.append(action_idx)
@@ -497,7 +523,9 @@ def collect_scheduling_episode_ppo_v2(env, policy, device="cpu"):
 def train_scheduling_episode_ppo_v2(env, policy, optimizer, baseline,
                                      entropy_coef=0.01, reward_scale=1.0,
                                      clip_epsilon=0.2, ppo_epochs=3,
-                                     device="cpu", track_kl: bool = False):
+                                     device="cpu", track_kl: bool = False,
+                                     cpf_blend_epsilon=0.0,
+                                     cpf_blend_schedule=None):
     """
     v2 PPO training step for the flat 2N action space.
 
@@ -514,7 +542,9 @@ def train_scheduling_episode_ppo_v2(env, policy, optimizer, baseline,
     for small divergences.
     """
     reward, old_log_probs, observations, actions, info = \
-        collect_scheduling_episode_ppo_v2(env, policy, device)
+        collect_scheduling_episode_ppo_v2(env, policy, device,
+                                          cpf_blend_epsilon=cpf_blend_epsilon,
+                                          cpf_blend_schedule=cpf_blend_schedule)
 
     scaled_reward = reward * reward_scale
     advantage = scaled_reward - baseline.get()
@@ -586,8 +616,10 @@ def train_scheduling_episode_ppo_v2(env, policy, optimizer, baseline,
             info["red_global_norm"] = red_attn["red_global_norm"]
             info["nonred_global_norm"] = red_attn["nonred_global_norm"]
             info["red_attn_ratio"] = red_attn["red_attn_ratio"]
-        except Exception:
-            pass  # best-effort; don't fail training over logging
+        except Exception as _log_e:
+            import traceback
+            traceback.print_exc()
+            print(f"  [WARN] Branch/reduction logging failed: {_log_e}")
 
     return reward, info
 
@@ -1875,6 +1907,15 @@ def chaos_annealing_train(
             baselines[label] = RunningBaseline(alpha=0.9)
         graph_baseline = baselines[label]
 
+        # ── CPF blending (burn-in guidance, decays to zero) ──
+        if in_burnin and cpf_blend_epsilon > 0:
+            burnin_progress = min(1.0, episode / max(1, burnin_episodes + burnin_extension))
+            blend_eps = cpf_blend_epsilon + (cpf_blend_epsilon_end - cpf_blend_epsilon) * burnin_progress
+            blend_sched = cpf_sched
+        else:
+            blend_eps = 0.0
+            blend_sched = None
+
         reward, info = train_scheduling_episode_ppo_v2(
             env, policy, optimizer, graph_baseline,
             entropy_coef=current_entropy_coef,
@@ -1883,6 +1924,8 @@ def chaos_annealing_train(
             ppo_epochs=ppo_epochs,
             device=device,
             track_kl=True,
+            cpf_blend_epsilon=blend_eps if in_burnin else 0.0,
+            cpf_blend_schedule=blend_sched if in_burnin else None,
         )
 
         # ═══════════════════════════════════════════════
@@ -2171,6 +2214,8 @@ def hierarchical_phase4_train(
     device: str = "cpu",
     dry_run: bool = False,
     partial_credit_per_issue: float = 0.1,
+    cpf_blend_epsilon: float = 0.4,
+    cpf_blend_epsilon_end: float = 0.0,
 ) -> dict:
     """
     Phase 4: Hierarchical GATv2 Training with Burn-in + Scaled Chaos.
@@ -2429,6 +2474,15 @@ def hierarchical_phase4_train(
             baselines[label] = RunningBaseline(alpha=0.9)
         graph_baseline = baselines[label]
 
+        # ── CPF blending (burn-in guidance, decays to zero) ──
+        if in_burnin and cpf_blend_epsilon > 0:
+            burnin_progress = min(1.0, episode / max(1, burnin_episodes + burnin_extension))
+            blend_eps = cpf_blend_epsilon + (cpf_blend_epsilon_end - cpf_blend_epsilon) * burnin_progress
+            blend_sched = cpf_sched
+        else:
+            blend_eps = 0.0
+            blend_sched = None
+
         reward, info = train_scheduling_episode_ppo_v2(
             env, policy, optimizer, graph_baseline,
             entropy_coef=current_entropy_coef,
@@ -2437,6 +2491,8 @@ def hierarchical_phase4_train(
             ppo_epochs=ppo_epochs,
             device=device,
             track_kl=True,
+            cpf_blend_epsilon=blend_eps if in_burnin else 0.0,
+            cpf_blend_schedule=blend_sched if in_burnin else None,
         )
 
         # ═══════════════════════════════════════════════
