@@ -8,6 +8,7 @@ Supports conditional routing (send_true / send_false) for Switch nodes.
 import os
 import re
 import math
+import random
 import subprocess
 from typing import List, Dict, Tuple, Optional, Any
 
@@ -519,6 +520,8 @@ class SchedulingGymEnv:
         latency: Optional[Dict[str, int]] = None,
         max_registers: Optional[int] = None,
         register_penalty_alpha: float = 0.0,
+        unit_limit: Optional[Dict[str, int]] = None,
+        latency_distribution: Optional[Dict[str, Tuple[int, int]]] = None,
     ):
         self.graph = graph
         self.vm_bridge = vm_bridge
@@ -528,6 +531,8 @@ class SchedulingGymEnv:
         self.latency = latency if latency is not None else DEFAULT_LATENCY
         self.max_registers = max_registers
         self.register_penalty_alpha = register_penalty_alpha
+        self.unit_limit = unit_limit if unit_limit is not None else {}
+        self.latency_distribution = latency_distribution if latency_distribution is not None else {}
         self.reset()
 
     def reset(self):
@@ -682,6 +687,7 @@ class SchedulingGymEnv:
                 info["cycles"] = sim_cycles
                 info["cycles_source"] = "simulated"
                 info["spill_penalty"] = spill_penalty
+                info["struct_stalls"] = self._sim_struct_stalls
                 if self.max_registers is not None:
                     info["max_live_registers"] = self._sim_max_live
                     info["registers"] = self.max_registers
@@ -701,6 +707,7 @@ class SchedulingGymEnv:
                     spill_penalty = self.register_penalty_alpha * spill_total
                 info = {"cycles": sim_cycles, "max_queue": 0, "cycles_source": "simulated"}
                 info["spill_penalty"] = spill_penalty
+                info["struct_stalls"] = self._sim_struct_stalls
                 if self.max_registers is not None:
                     info["max_live_registers"] = self._sim_max_live
                     info["registers"] = self.max_registers
@@ -728,6 +735,9 @@ class SchedulingGymEnv:
         The schedule order determines issue priority: at each cycle, the
         first K ready nodes in schedule order are issued.
         """
+        # Deterministic seed per schedule (reproducible per graph)
+        schedule_seed = hash(tuple(self.schedule)) & 0x7FFFFFFF
+        random.seed(schedule_seed)
         K = self.max_exec_units
         graph = self.graph
         schedule = self.schedule
@@ -757,6 +767,9 @@ class SchedulingGymEnv:
 
         # completion_cycle[node] = cycle when this node finishes executing
         completion: Dict[str, int] = {}
+        # In-flight instruction counts per opcode (for port constraint tracking)
+        in_flight_counts: Dict[str, int] = {}
+        struct_stalls = 0
 
         cycle = 0
         n = len(schedule)
@@ -822,6 +835,15 @@ class SchedulingGymEnv:
                     # No ready node — structural bubble. Advance clock.
                     break
 
+                # ── Port constraint check ────────────────────
+                # If this node's opcode type exceeds the physical unit limit,
+                # stall structurally regardless of register pressure.
+                node_type_found = graph.nodes[found].type
+                if node_type_found in self.unit_limit:
+                    if in_flight_counts.get(node_type_found, 0) >= self.unit_limit[node_type_found]:
+                        struct_stalls += 1
+                        break  # structural stall — unit busy
+
                 # Register pressure check: stall only if registers are over
                 # capacity AND the next ready instruction cannot free any
                 # register. A consumer frees a register when its input's
@@ -845,9 +867,15 @@ class SchedulingGymEnv:
                         break  # No register can be freed — stall
 
                 # Issue this instruction: it completes after its latency
-                l = lat.get(graph.nodes[found].type, 1)
+                # (deterministic or stochastic depending on latency_distribution)
+                if node_type_found in self.latency_distribution:
+                    min_l, max_l = self.latency_distribution[node_type_found]
+                    l = random.randint(min_l, max_l)
+                else:
+                    l = lat.get(node_type_found, 1)
                 completion[found] = cycle + l
                 issued += 1
+                in_flight_counts[node_type_found] = in_flight_counts.get(node_type_found, 0) + 1
 
                 # Decrement consumer counts for inputs (register freed when last consumer issues)
                 if max_regs is not None:
@@ -872,6 +900,12 @@ class SchedulingGymEnv:
             for nid in list(completion.keys()):
                 if nid not in freed and completion[nid] <= cycle:
                     freed.add(nid)
+                    # Decrement in-flight count (port slot freed)
+                    completed_type = graph.nodes[nid].type
+                    if completed_type in self.unit_limit:
+                        in_flight_counts[completed_type] = max(
+                            0, in_flight_counts.get(completed_type, 0) - 1
+                        )
                     for child_id, child_node in graph.nodes.items():
                         for parent_id, _ in child_node.dependencies:
                             if parent_id == nid and child_id in remaining:
@@ -890,6 +924,7 @@ class SchedulingGymEnv:
 
         self._sim_max_live = max_live
         self._sim_live_regs_history = live_regs_history
+        self._sim_struct_stalls = struct_stalls
         return max(completion.values())
 
     def _generate_dfasm(self) -> str:
