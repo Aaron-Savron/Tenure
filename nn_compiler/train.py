@@ -145,6 +145,7 @@ def collect_scheduling_episode(env, policy, device="cpu"):
             final_info = {"error": "No valid actions (empty ready set)",
                           "partial_credit": partial_credit}
 
+                      break
         node_id = obs["node_names"][node_idx]
         log_probs.append(log_prob)
         entropies.append(policy.get_entropy(obs_on_device))
@@ -219,6 +220,7 @@ def collect_scheduling_episode_ppo(env, policy, device="cpu"):
             final_info = {"error": "No valid actions (empty ready set)",
                           "partial_credit": partial_credit}
 
+                      break
         node_id = obs["node_names"][node_idx]
         old_log_probs.append(log_prob.detach())
         observations.append(obs_on_device)
@@ -479,6 +481,7 @@ def collect_scheduling_episode_ppo_v2(env, policy, device="cpu"):
             final_info = {"error": "No valid actions (empty action mask)",
                           "partial_credit": partial_credit}
 
+                      break
         old_log_probs.append(log_prob.detach())
         observations.append(obs_on_device)
         actions.append(action_idx)
